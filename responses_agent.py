@@ -211,8 +211,8 @@ class Services:
             t0 = time.perf_counter()
             try:
                 try:
-                    from app.services.mem0_qdrant import build_mem0_qdrant
-                    from app.services.deepinfra import embed_catalog, rerank_qwen
+                    from services.mem0_qdrant import build_mem0_qdrant
+                    from services.deepinfra import embed_catalog, rerank_qwen
                 except ImportError:
                     from services.mem0_qdrant import build_mem0_qdrant
                     from services.deepinfra import embed_catalog, rerank_qwen
