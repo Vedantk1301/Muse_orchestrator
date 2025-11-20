@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 import requests
-from openai import AsyncOpenAI
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -139,7 +139,7 @@ class Config:
     DEBUG = os.getenv("MUSEBOT_DEBUG", "1") == "1"
 
 
-client = AsyncOpenAI(api_key=Config.OPENAI_API_KEY)
+client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
 # Trend cache on disk (JSON)
 TREND_CACHE_FILE = Path(os.getenv("TREND_CACHE_FILE", "cache/fashion_trends.json"))
@@ -378,7 +378,8 @@ Rules:
 """.strip()
 
     try:
-        resp = await client.responses.create(
+        resp = await asyncio.to_thread(
+            client.responses.create,
             model=Config.FAST_MODEL,
             input=[
                 {"role": "system", "content": system_prompt},
@@ -834,7 +835,8 @@ Remember:
 """.strip()
 
     try:
-        response = await client.responses.create(
+        response = await asyncio.to_thread(
+            client.responses.create,
             model=Config.FAST_MODEL,
             input=[
                 {"role": "system", "content": system_prompt},
@@ -1228,7 +1230,8 @@ async def t_tone_reply(
     logger.info("✨ tone_reply")
 
     try:
-        response = await client.responses.create(
+        response = await asyncio.to_thread(
+            client.responses.create,
             model=Config.FAST_MODEL,
             input=[
                 {
@@ -1624,15 +1627,11 @@ async def run_conversation(
             llm_t0 = time.perf_counter()
             logger.info("🤖 Calling LLM", model=Config.MAIN_MODEL, iteration=iteration + 1)
 
-            # We use streaming if a token_callback is provided, but only for the final text generation?
-            # Actually, we can stream everything, but we need to handle tool calls in the stream.
-            # For simplicity, we will stream ONLY if token_callback is set.
-            
-            is_streaming = (token_callback is not None)
-            
-            # Note: client.responses.create might not support stream=True if it's a custom thing,
-            # but assuming standard OpenAI behavior for chat.completions:
-            response_stream = await client.responses.create(
+            # Reverting to non-streaming call to ensure reliability with the custom 'responses' endpoint
+            # We will simulate streaming output for the frontend UX
+            # Using asyncio.to_thread to prevent blocking the event loop
+            response = await asyncio.to_thread(
+                client.responses.create,
                 model=Config.MAIN_MODEL,
                 input=conversation,
                 tools=TOOLS_SCHEMA,
@@ -1641,7 +1640,6 @@ async def run_conversation(
                 max_output_tokens=800,
                 max_tool_calls=Config.MAX_TOOL_CALLS,
                 parallel_tool_calls=True,
-                stream=is_streaming,
                 metadata={
                     "user_id": user_id,
                     "thread_id": thread_id,
@@ -1649,66 +1647,20 @@ async def run_conversation(
                 },
             )
 
-            final_text = ""
-            reasoning_blocks = []
-            function_calls = []
-            message_blocks = []
-            
-            if is_streaming:
-                # Handle Streaming Response
-                current_tool_calls = {} # index -> tool_call_snapshot
-                
-                async for chunk in response_stream:
-                    # This logic depends on the exact shape of 'chunk' from client.responses
-                    # Assuming it mimics chat.completions.create(stream=True)
-                    
-                    # 1. Text Content
-                    content = chunk.output_text if hasattr(chunk, "output_text") else ""
-                    # Some SDKs use chunk.choices[0].delta.content
-                    # But the user code uses 'response.output_text' and 'response.output' blocks.
-                    # If this is a custom 'responses' endpoint, the stream chunk format is unknown.
-                    # SAFE FALLBACK: If we can't stream properly due to unknown SDK, we might have to await full.
-                    # However, let's assume standard delta structure or similar.
-                    
-                    # If the user is using a custom SDK where 'responses' returns a specific object,
-                    # streaming might work differently. 
-                    # Given "Code works fine", let's try to adapt to the likely structure.
-                    # If 'chunk' has 'output_text', we use it.
-                    
-                    if content:
-                        final_text += content
-                        if token_callback:
-                            await token_callback(content)
-                            
-                    # 2. Tool Calls / Output Blocks
-                    # If the custom SDK yields blocks in the stream:
-                    if hasattr(chunk, "output"):
-                        for block in chunk.output:
-                            if block.type == "reasoning":
-                                reasoning_blocks.append(block.to_dict())
-                            elif block.type == "function_call":
-                                function_calls.append(block)
-                            elif block.type == "message":
-                                message_blocks.append(block.to_dict())
-                                
-            else:
-                # Non-streaming (Standard await)
-                response = response_stream # it's already the response object
-                
-                reasoning_blocks = [
-                    block.to_dict() for block in response.output if block.type == "reasoning"
-                ]
-                function_calls = [
-                    block for block in response.output if block.type == "function_call"
-                ]
-                message_blocks = [
-                    block.to_dict() for block in response.output if block.type == "message"
-                ]
-                final_text = (response.output_text or "").strip()
-
             llm_ms = int((time.perf_counter() - llm_t0) * 1000)
             op_name = "llm_initial" if iteration == 0 else f"llm_iteration_{iteration}"
             logger.perf(op_name, llm_ms, model=Config.MAIN_MODEL)
+
+            reasoning_blocks = [
+                block.to_dict() for block in response.output if block.type == "reasoning"
+            ]
+            function_calls = [
+                block for block in response.output if block.type == "function_call"
+            ]
+            message_blocks = [
+                block.to_dict() for block in response.output if block.type == "message"
+            ]
+            final_text = (response.output_text or "").strip()
 
             logger.debug(
                 "🔄 Iteration summary",
@@ -1740,7 +1692,8 @@ async def run_conversation(
             if not final_text:
                 logger.warning("⚠️ Empty LLM reply, falling back to FAST_MODEL")
                 try:
-                    fb = await client.responses.create(
+                    fb = await asyncio.to_thread(
+                        client.responses.create,
                         model=Config.FAST_MODEL,
                         input=[
                             {
@@ -1757,16 +1710,19 @@ async def run_conversation(
                         max_output_tokens=200,
                     )
                     final_text = (fb.output_text or "").strip()
-                    if token_callback and final_text:
-                        await token_callback(final_text)
                 except Exception as e:
                     logger.error("❌ Fallback LLM failed", error=str(e))
                     final_text = (
                         "Sorry, I glitched and could not finish that answer. "
                         "Could you try again once 😅"
                     )
-                    if token_callback:
-                        await token_callback(final_text)
+
+            # Simulate streaming for UX
+            if token_callback and final_text:
+                chunk_size = 8
+                for i in range(0, len(final_text), chunk_size):
+                    await token_callback(final_text[i : i + chunk_size])
+                    await asyncio.sleep(0.005)
 
             total_ms = int((time.perf_counter() - conv_t0) * 1000)
             budget_summary = budget.get_summary()
@@ -1815,33 +1771,45 @@ async def run_conversation_stream(
     ack_t0 = time.perf_counter()
     try:
         logger.info("⚡ Generating ACK")
-        ack_resp = await client.responses.create(
+        ack_resp = await asyncio.to_thread(
+            client.responses.create,
             model=Config.FAST_MODEL,
             input=[
                 {
                     "role": "system",
                     "content": (
-                        "You are MuseBot, a friendly Indian fashion stylist for MUSE.\n"
-                        "Write a very short acknowledgement, 1 sentence, maximum 1 emoji. "
-                        "Hint that you will help with outfits or shopping next. "
-                        "No follow up questions in the acknowledgement. "
-                        "Never return an empty reply. "
-                        "Do not use the rainbow emoji and do not use long dashes."
+                        "You are MuseBot, a Gen Z fashion enthusiast and bestie. \n"
+                        "Your goal: Acknowledge the user's message with high energy and slang. \n"
+                        "Rules:\n"
+                        "1. If the user says 'Hello', 'Hi', 'Hey': Reply with 'Yo!', 'Hey bestie!', 'What's good?', 'Ayoo!', or 'Hey style icon!'. \n"
+                        "2. If the user gives a task/preference: Say 'Bet', 'Say less', 'On it', 'Cooking that up', 'Gotcha'. \n"
+                        "3. Max 5 words. No emojis (the main bot uses them). \n"
+                        "4. NEVER say 'I will help you' or 'Let us fix your fits'. Be cool."
                     ),
                 },
                 {"role": "user", "content": message},
             ],
-            max_output_tokens=50,
+            reasoning={"effort": "low"},
+            max_output_tokens=300,
         )
         ack = (ack_resp.output_text or "").strip()
+        
+        # Debug empty response
         if not ack:
-            ack = "Got you, let us fix your fits 🙂"
+            logger.warning("⚠️ ACK response was empty", raw_resp=str(ack_resp))
+            import random
+            fallbacks = ["Bet!", "On it!", "Say less.", "Gotcha.", "Cooking that up...", "Yo, checking!"]
+            ack = random.choice(fallbacks)
+            
         ack_ms = int((time.perf_counter() - ack_t0) * 1000)
         logger.success("✅ ACK generated", duration_ms=ack_ms, ack=ack)
         yield ack
     except Exception as e:
+        import random
+        fallbacks = ["Bet!", "On it!", "Say less.", "Gotcha.", "Cooking that up...", "Yo, checking!"]
+        fallback_ack = random.choice(fallbacks)
         logger.warning("⚠️ ACK generation failed", error=str(e))
-        yield "Got you, let us fix your fits 🙂"
+        yield fallback_ack
 
     await asyncio.sleep(0.5)
 
