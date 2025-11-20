@@ -26,7 +26,8 @@ async def bot_response(history, user_id):
     thread_id = f"webui-{user_id}"
 
     # Create the generator
-    generator = run_conversation_stream(user_id, last_user_msg, thread_id)
+    # Pass history excluding the last message (which is the current user message)
+    generator = run_conversation_stream(user_id, last_user_msg, thread_id, history[:-1])
 
     # 1. Get the ACK (first chunk)
     try:
@@ -36,22 +37,64 @@ async def bot_response(history, user_id):
 
     # Append ACK to history
     history.append({"role": "assistant", "content": ack_text})
-    yield history
+    yield history, None, None
 
-    # Small delay to let the user register the ACK
     await asyncio.sleep(0.5)
 
     # 2. Prepare for the Real Response (New Bubble)
     # Start with a typing indicator
     history.append({"role": "assistant", "content": "..."})
-    yield history
+    yield history, None, gr.update(visible=True)
     
     full_response = ""
+    products = []
+    options = []
+    import json
+    
     async for chunk in generator:
+        # Check for hidden product data
+        if chunk.startswith("__PRODUCTS__"):
+            try:
+                products_json = chunk.replace("__PRODUCTS__", "")
+                products = json.loads(products_json)
+            except Exception:
+                pass
+            continue
+            
+        if chunk.startswith("__OPTIONS__"):
+            try:
+                options_json = chunk.replace("__OPTIONS__", "")
+                options = json.loads(options_json)
+            except Exception:
+                pass
+            continue
+            
         full_response += chunk
         # Update the LAST message (the real response)
         history[-1]["content"] = full_response
-        yield history
+        yield history, None, gr.update(visible=True)
+
+    # After stream ends, if we have products, show them
+    if products:
+        # Format for Gallery: list of (image_url, caption) tuples
+        # Ensure we have valid images
+        gallery_data = []
+        for p in products:
+            img = p.get("image_url") or p.get("image") or "https://via.placeholder.com/300?text=No+Image"
+            name = p.get("title") or p.get("name") or "Product"
+            price = p.get("price_inr") or p.get("price")
+            caption = f"{name}\n(₹{price})" if price else name
+            gallery_data.append((img, caption))
+            
+        yield history, gallery_data, gr.update(visible=True)
+        
+    # If options found, update the dataset
+    if options:
+        # Dataset expects a list of lists: [['Option 1'], ['Option 2']]
+        samples = [[opt] for opt in options]
+        yield history, None, gr.update(samples=samples, visible=True)
+    else:
+        yield history, None, gr.update(samples=[], visible=False)
 
 with gr.Blocks(title="🎨 MuseBot — Fashion Assistant", theme=gr.themes.Soft()) as demo:
     gr.Markdown(
@@ -78,6 +121,26 @@ with gr.Blocks(title="🎨 MuseBot — Fashion Assistant", theme=gr.themes.Soft(
         user_id_box = gr.Textbox(value="demo_user", label="User ID", scale=1)
         submit_btn = gr.Button("Send", variant="primary", scale=1)
 
+    # Interactive Chips (Suggestions)
+    suggestion_chips = gr.Dataset(
+        components=[gr.Textbox(visible=False)],
+        label="Quick Replies",
+        samples=[],
+        visible=False,
+    )
+
+    # Product Gallery
+    with gr.Row():
+        product_gallery = gr.Gallery(
+            label="Recommended Products",
+            show_label=True,
+            elem_id="product_gallery",
+            columns=[4],
+            rows=[1],
+            object_fit="contain",
+            height="auto",
+        )
+
     # Examples
     gr.Examples(
         examples=[
@@ -99,7 +162,7 @@ with gr.Blocks(title="🎨 MuseBot — Fashion Assistant", theme=gr.themes.Soft(
         # 2. Bot responds (streaming)
         bot_response,
         [chatbot, user_id_box],
-        [chatbot]
+        [chatbot, product_gallery, suggestion_chips]
     )
     
     submit_btn.click(
@@ -109,13 +172,45 @@ with gr.Blocks(title="🎨 MuseBot — Fashion Assistant", theme=gr.themes.Soft(
     ).then(
         bot_response,
         [chatbot, user_id_box],
-        [chatbot]
+        [chatbot, product_gallery, suggestion_chips]
     )
+    
+    # Handle chip clicks
+    def on_chip_click(sample):
+        # sample is a list like ['Option 1']
+        text = sample[0]
+        return text
+
+    suggestion_chips.click(
+        on_chip_click,
+        inputs=[suggestion_chips],
+        outputs=[msg]
+    ).then(
+        add_user_message,
+        [msg, chatbot],
+        [msg, chatbot]
+    ).then(
+        bot_response,
+        [chatbot, user_id_box],
+        [chatbot, product_gallery, suggestion_chips]
+    )
+
+    # Status & Preloading
+    status_box = gr.Markdown("⏳ Connecting to Muse services...", visible=True)
+
+    async def start_up():
+        from responses_agent import Services
+        try:
+            await Services.ensure_loaded()
+            return "✅ Muse Services Ready"
+        except Exception as e:
+            return f"❌ Service Error: {e}"
+
+    demo.load(start_up, outputs=status_box)
 
 if __name__ == "__main__":
     demo.queue()
     demo.launch(
         server_name="127.0.0.1",
-        server_port=7860,
         show_error=True,
     )

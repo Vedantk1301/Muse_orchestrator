@@ -628,17 +628,13 @@ class Budget:
     def remaining_ms(self) -> int:
         return max(0, self.max_latency_ms - self.latency_ms)
 
-    def get_summary(self) -> Dict:
+    def get_summary(self):
         return {
-            "total_calls": self.calls_used,
-            "max_calls": self.max_calls,
-            "total_latency_ms": self.latency_ms,
-            "max_latency_ms": self.max_latency_ms,
-            "remaining_ms": self.remaining_ms(),
-            "tools_used": self.tool_log,
+            "calls_used": self.calls_used,
+            "latency_ms": self.latency_ms,
+            "tool_log": self.tool_log,
+            "last_options": getattr(self, "last_options", []),
         }
-
-
 # =============================================================================
 # Profile tools (kept internal for future use)
 # =============================================================================
@@ -1003,8 +999,10 @@ async def t_search_fashion_products(
         logger.perf("qdrant_search", search_ms, num_queries=len(queries))
 
         # Aggregate products → CARD FORMAT
-        all_products: List[Dict[str, Any]] = []
-        seen_ids = set()
+        # Interleave results from multiple queries to ensure diversity
+        # e.g. [Q1_1, Q2_1, Q3_1, Q1_2, Q2_2, Q3_2, ...]
+        
+        results_lists = []
         best_score = 0.0
         per_query = (
             min(Config.FINAL_RERANK_TOP_K * 2, Config.PRODUCTS_PER_QUERY)
@@ -1016,20 +1014,19 @@ async def t_search_fashion_products(
             if isinstance(result, Exception):
                 logger.warning(f"Query {i} failed", error=str(result))
                 continue
-
+            
+            q_products = []
             for point in (result.points or [])[:per_query]:
                 payload = point.payload or {}
                 commerce = payload.get("commerce") or {}
-
                 pid = (
                     payload.get("product_id")
                     or payload.get("id")
                     or getattr(point, "id", None)
                 )
-                if not pid or pid in seen_ids:
+                if not pid:
                     continue
-
-                seen_ids.add(pid)
+                    
                 score = float(point.score)
                 best_score = max(best_score, score)
 
@@ -1043,18 +1040,33 @@ async def t_search_fashion_products(
                     or payload.get("image_url"),
                     "url": payload.get("url"),
                     "price": commerce.get("price"),
-                    "price_inr": commerce.get("price"),
-                    "in_stock": commerce.get("in_stock"),
-                    "colors_available": commerce.get("colors_in_stock", []),
-                    "sizes_available": commerce.get("sizes_in_stock", []),
+                    "price_inr": commerce.get("price_inr"),
                     "score": score,
                     "from_query": q,
                 }
+                q_products.append(card)
+            results_lists.append(q_products)
 
-                all_products.append(card)
+        # Interleave
+        all_products: List[Dict[str, Any]] = []
+        seen_ids = set()
+        
+        if not results_lists:
+            pass
+        else:
+            max_len = max(len(lst) for lst in results_lists)
+            for i in range(max_len):
+                for lst in results_lists:
+                    if i < len(lst):
+                        p = lst[i]
+                        if p["id"] not in seen_ids:
+                            seen_ids.add(p["id"])
+                            all_products.append(p)
 
-        # Sort by score descending to ensure best matches from ALL queries bubble up
-        all_products.sort(key=lambda x: x["score"], reverse=True)
+        # Only sort by score if we have a SINGLE query. 
+        # If multiple, we trust the interleaving to provide better relevance/diversity mix.
+        if len(queries) == 1:
+            all_products.sort(key=lambda x: x["score"], reverse=True)
 
         logger.debug(
             "📦 Aggregated products", count=len(all_products), best_score=best_score
@@ -1269,13 +1281,21 @@ async def t_tone_reply(
 
 
 # =============================================================================
-# Tool Registry
+# Show Options (Chips)
 # =============================================================================
+async def t_show_options(options: List[str]) -> Dict[str, Any]:
+    """
+    Display clickable UI chips/buttons to the user.
+    """
+    logger.info("🔘 show_options", options=options)
+    return {"options": options}
+
 TOOLS_MAP = {
     "search_fashion_products": t_search_fashion_products,
     "tone_reply": t_tone_reply,
     "get_weather": t_get_weather,
     "generate_search_suggestions": t_generate_search_suggestions,
+    "show_options": t_show_options,
 }
 
 TOOLS_SCHEMA = [
@@ -1285,8 +1305,11 @@ TOOLS_SCHEMA = [
         "description": (
             "Smart fashion search backed ONLY by the internal catalog (Qdrant). "
             "Use this for any request that involves buying, showing, or recommending items. "
-            "Queries must be fashion-only (clothes, shoes, accessories) and gender neutral; "
-            "do NOT put price/budget words inside the query."
+            "CRITICAL: You must translate abstract vibes into SPECIFIC product queries. "
+            "BAD Query: 'masculine wardrobe staples', 'party wear', 'office outfit' "
+            "GOOD Query: 'White Linen Shirt', 'Navy Blue Chinos', 'Black Leather Boots', 'Beige Cotton Trousers' "
+            "The search engine only understands: Material, Color, Fit, Category, Pattern. "
+            "ALWAYS split a look into multiple specific queries if needed."
         ),
         "parameters": {
             "type": "object",
@@ -1345,6 +1368,26 @@ TOOLS_SCHEMA = [
                 "context": {"type": "string"},
             },
             "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "show_options",
+        "description": (
+            "Show clickable UI buttons/chips to the user. "
+            "Use this whenever you ask a multiple-choice question (e.g. Gender, Budget, Occasion) "
+            "or when you want to offer quick replies."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of short button labels (max 4-5 items)",
+                },
+            },
+            "required": ["options"],
         },
     },
 ]
@@ -1487,6 +1530,12 @@ OVERALL UX VIBE:
   - Instead, show the suggestions as short chips in text and ask the user which one they want.
   - When the user picks one, THEN call “search_fashion_products” again with a refined query or filters based on their choice.
 
+12) Interactive Options:
+- Whenever you ask a question with clear choices (e.g. "Masculine or Feminine?", "Work or Party?", "Under 2k or 5k?"):
+  - Call the "show_options" tool with the list of choices.
+  - This will show clickable buttons to the user.
+  - Example: show_options(options=["Masculine", "Feminine", "Neutral"])
+
 IMPORTANT:
 - Never respond with an empty message.
 - Each reply must have at least one or two sentences in total, or one sentence plus bullets plus a question.
@@ -1543,6 +1592,10 @@ async def _run_single_tool_call(tool_call, budget: Budget) -> Dict[str, Any]:
         if name == "search_fashion_products" and isinstance(result, dict):
             budget.last_search_result = result
             budget.last_products = result.get("products", []) or []
+            
+        # Capture options
+        if name == "show_options" and isinstance(result, dict):
+            budget.last_options = result.get("options", [])
 
         ms = int((time.perf_counter() - t0) * 1000)
         budget.consume(name or "unknown", ms, success=True)
@@ -1570,6 +1623,7 @@ async def run_conversation(
     user_id: str, 
     message: str, 
     thread_id: str, 
+    history: List[Dict[str, str]] = [],
     token_callback: Optional[callable] = None
 ) -> Dict[str, Any]:
     logger.info(
@@ -1617,6 +1671,12 @@ async def run_conversation(
             }
         )
 
+    # Inject history (memory)
+    if history:
+        # Sanitize history to ensure only role and content are passed
+        clean_history = [{"role": m["role"], "content": m["content"]} for m in history if "role" in m and "content" in m]
+        conversation.extend(clean_history)
+
     conversation.append({"role": "user", "content": message})
 
     conv_t0 = time.perf_counter()
@@ -1640,11 +1700,6 @@ async def run_conversation(
                 max_output_tokens=800,
                 max_tool_calls=Config.MAX_TOOL_CALLS,
                 parallel_tool_calls=True,
-                metadata={
-                    "user_id": user_id,
-                    "thread_id": thread_id,
-                    "iteration": str(iteration + 1),
-                },
             )
 
             llm_ms = int((time.perf_counter() - llm_t0) * 1000)
@@ -1740,6 +1795,7 @@ async def run_conversation(
                 "text": final_text,
                 "products": budget.last_products,
                 "search_result": budget.last_search_result,
+                "options": getattr(budget, "last_options", []),
             }
 
         logger.warning("⚠️ Max iterations (8) reached")
@@ -1747,6 +1803,7 @@ async def run_conversation(
             "text": "I got a bit carried away there 😅 Could you say it a bit simpler",
             "products": budget.last_products,
             "search_result": budget.last_search_result,
+            "options": getattr(budget, "last_options", []),
         }
 
     except Exception as e:
@@ -1764,7 +1821,7 @@ async def run_conversation(
 # Streaming wrapper
 # =============================================================================
 async def run_conversation_stream(
-    user_id: str, message: str, thread_id: str
+    user_id: str, message: str, thread_id: str, history: List[Dict[str, str]] = []
 ) -> AsyncGenerator[str, None]:
     logger.info("📡 STREAMING conversation", user_id=user_id, message=message[:50])
 
@@ -1781,16 +1838,18 @@ async def run_conversation_stream(
                         "You are MuseBot, a Gen Z fashion enthusiast and bestie. \n"
                         "Your goal: Acknowledge the user's message with high energy and slang. \n"
                         "Rules:\n"
-                        "1. If the user says 'Hello', 'Hi', 'Hey': Reply with 'Yo!', 'Hey bestie!', 'What's good?', 'Ayoo!', or 'Hey style icon!'. \n"
-                        "2. If the user gives a task/preference: Say 'Bet', 'Say less', 'On it', 'Cooking that up', 'Gotcha'. \n"
+                        "1. If the user says 'Hello', 'Hi', 'Hey' AND it is the start: Reply with 'Yo!', 'Hey bestie!', 'What's good?'. \n"
+                        "2. If the user gives a task/preference or answers a question: Say 'Bet', 'Say less', 'On it', 'Gotcha', 'Ooh nice'. \n"
                         "3. Max 5 words. No emojis (the main bot uses them). \n"
-                        "4. NEVER say 'I will help you' or 'Let us fix your fits'. Be cool."
+                        "4. NEVER say 'I will help you' or 'Let us fix your fits'. Be cool.\n"
+                        "5. AVOID repetitive greetings like 'Hey bestie' if the conversation is already ongoing."
                     ),
                 },
+                *[{"role": m["role"], "content": m["content"]} for m in history[-4:] if "role" in m and "content" in m], # Context for ACK
                 {"role": "user", "content": message},
             ],
             reasoning={"effort": "low"},
-            max_output_tokens=300,
+            max_output_tokens=500,
         )
         ack = (ack_resp.output_text or "").strip()
         
@@ -1823,7 +1882,7 @@ async def run_conversation_stream(
         
     # Start conversation in background
     task = asyncio.create_task(
-        run_conversation(user_id, message, thread_id, token_callback=_callback)
+        run_conversation(user_id, message, thread_id, history=history, token_callback=_callback)
     )
     
     # Yield tokens as they come
@@ -1843,8 +1902,15 @@ async def run_conversation_stream(
     # Get final result to ensure we catch any exceptions
     final = await task
     
-    # If we didn't stream anything (e.g. error or empty), yield the final text
-    # But usually the callback would have handled it.
+    # Yield products as a special hidden chunk if available
+    if isinstance(final, dict):
+        if final.get("products"):
+            import json
+            yield f"__PRODUCTS__{json.dumps(final['products'])}"
+            
+        if final.get("options"):
+            import json
+            yield f"__OPTIONS__{json.dumps(final['options'])}"
     # We don't yield final['text'] here because it would duplicate what was streamed.
 
 
