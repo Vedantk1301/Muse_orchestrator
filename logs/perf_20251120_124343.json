@@ -1,0 +1,238 @@
+[
+  {
+    "timestamp": "2025-11-20T12:44:23.354232",
+    "operation": "tavily_trends",
+    "duration_ms": 8488,
+    "queries": 2
+  },
+  {
+    "timestamp": "2025-11-20T12:44:32.511194",
+    "operation": "llm_initial",
+    "duration_ms": 9155,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:44:32.522568",
+    "operation": "conversation_total",
+    "duration_ms": 9160,
+    "total_calls": 0,
+    "max_calls": 10,
+    "total_latency_ms": 0,
+    "max_latency_ms": 15000,
+    "remaining_ms": 15000,
+    "tools_used": []
+  },
+  {
+    "timestamp": "2025-11-20T12:46:08.452229",
+    "operation": "llm_initial",
+    "duration_ms": 5679,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:46:08.455228",
+    "operation": "conversation_total",
+    "duration_ms": 5680,
+    "total_calls": 0,
+    "max_calls": 10,
+    "total_latency_ms": 0,
+    "max_latency_ms": 15000,
+    "remaining_ms": 15000,
+    "tools_used": []
+  },
+  {
+    "timestamp": "2025-11-20T12:47:37.490824",
+    "operation": "llm_initial",
+    "duration_ms": 10098,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:47:37.492822",
+    "operation": "conversation_total",
+    "duration_ms": 10100,
+    "total_calls": 0,
+    "max_calls": 10,
+    "total_latency_ms": 0,
+    "max_latency_ms": 15000,
+    "remaining_ms": 15000,
+    "tools_used": []
+  },
+  {
+    "timestamp": "2025-11-20T12:48:54.093679",
+    "operation": "llm_initial",
+    "duration_ms": 5553,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:48:58.652818",
+    "operation": "embed",
+    "duration_ms": 1667,
+    "num_queries": 1
+  },
+  {
+    "timestamp": "2025-11-20T12:49:00.672717",
+    "operation": "qdrant_search",
+    "duration_ms": 2008,
+    "num_queries": 1
+  },
+  {
+    "timestamp": "2025-11-20T12:49:01.810402",
+    "operation": "rerank",
+    "duration_ms": 1136,
+    "num_products": 15
+  },
+  {
+    "timestamp": "2025-11-20T12:49:06.922403",
+    "operation": "llm_iteration_1",
+    "duration_ms": 5103,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:49:10.910476",
+    "operation": "llm_iteration_2",
+    "duration_ms": 3983,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:49:10.910476",
+    "operation": "conversation_total",
+    "duration_ms": 22369,
+    "total_calls": 2,
+    "max_calls": 10,
+    "total_latency_ms": 7708,
+    "max_latency_ms": 15000,
+    "remaining_ms": 7292,
+    "tools_used": [
+      {
+        "tool": "search_fashion_products",
+        "duration_ms": 7708,
+        "success": true,
+        "timestamp": "2025-11-20T12:49:01.817923"
+      },
+      {
+        "tool": "generate_search_suggestions",
+        "duration_ms": 0,
+        "success": true,
+        "timestamp": "2025-11-20T12:49:06.926511"
+      }
+    ]
+  },
+  {
+    "timestamp": "2025-11-20T12:50:48.989756",
+    "operation": "llm_initial",
+    "duration_ms": 4458,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:50:53.133432",
+    "operation": "embed",
+    "duration_ms": 1681,
+    "num_queries": 1
+  },
+  {
+    "timestamp": "2025-11-20T12:50:54.739033",
+    "operation": "qdrant_search",
+    "duration_ms": 1607,
+    "num_queries": 1
+  },
+  {
+    "timestamp": "2025-11-20T12:50:55.894727",
+    "operation": "rerank",
+    "duration_ms": 1153,
+    "num_products": 15
+  },
+  {
+    "timestamp": "2025-11-20T12:51:09.744104",
+    "operation": "llm_iteration_1",
+    "duration_ms": 13841,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:51:09.745035",
+    "operation": "conversation_total",
+    "duration_ms": 25215,
+    "total_calls": 2,
+    "max_calls": 10,
+    "total_latency_ms": 10516,
+    "max_latency_ms": 15000,
+    "remaining_ms": 4484,
+    "tools_used": [
+      {
+        "tool": "get_weather",
+        "duration_ms": 3610,
+        "success": true,
+        "timestamp": "2025-11-20T12:50:52.600145"
+      },
+      {
+        "tool": "search_fashion_products",
+        "duration_ms": 6906,
+        "success": true,
+        "timestamp": "2025-11-20T12:50:55.894727"
+      }
+    ]
+  },
+  {
+    "timestamp": "2025-11-20T12:55:55.539773",
+    "operation": "llm_initial",
+    "duration_ms": 10021,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:55:55.542766",
+    "operation": "conversation_total",
+    "duration_ms": 10023,
+    "total_calls": 0,
+    "max_calls": 10,
+    "total_latency_ms": 0,
+    "max_latency_ms": 15000,
+    "remaining_ms": 15000,
+    "tools_used": []
+  },
+  {
+    "timestamp": "2025-11-20T12:56:05.152292",
+    "operation": "llm_initial",
+    "duration_ms": 4515,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:56:10.090110",
+    "operation": "embed",
+    "duration_ms": 1956,
+    "num_queries": 1
+  },
+  {
+    "timestamp": "2025-11-20T12:56:12.176225",
+    "operation": "qdrant_search",
+    "duration_ms": 2085,
+    "num_queries": 1
+  },
+  {
+    "timestamp": "2025-11-20T12:56:15.293025",
+    "operation": "rerank",
+    "duration_ms": 3115,
+    "num_products": 15
+  },
+  {
+    "timestamp": "2025-11-20T12:56:22.482309",
+    "operation": "llm_iteration_1",
+    "duration_ms": 7195,
+    "model": "gpt-5-mini"
+  },
+  {
+    "timestamp": "2025-11-20T12:56:22.482309",
+    "operation": "conversation_total",
+    "duration_ms": 21855,
+    "total_calls": 1,
+    "max_calls": 10,
+    "total_latency_ms": 10139,
+    "max_latency_ms": 15000,
+    "remaining_ms": 4861,
+    "tools_used": [
+      {
+        "tool": "search_fashion_products",
+        "duration_ms": 10139,
+        "success": true,
+        "timestamp": "2025-11-20T12:56:15.293998"
+      }
+    ]
+  }
+]

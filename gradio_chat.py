@@ -1,7 +1,7 @@
 # app/gradio.py
 
 import gradio as gr
-from app.responses_agent import run_conversation  # or app.production_agent if that's the filename
+from responses_agent import run_conversation  # or app.production_agent if that's the filename
 
 
 def build_context_from_history(history, user_msg: str) -> str:
