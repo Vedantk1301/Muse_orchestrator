@@ -836,8 +836,8 @@ async def t_classify_intent(
     forced_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Classify the fashion search intent. Uses FAST_MODEL (Responses API) and caches
-    results. Uses plain JSON output for robustness.
+    Classify the fashion search intent. Uses FAST_MODEL (Responses API) with
+    very explicit JSON instructions in the system prompt.
     """
     cache_key = _cache_key("intent", query.lower(), forced_type or "", user_gender or "")
     cached = await INTENT_CACHE.get(cache_key)
@@ -858,116 +858,181 @@ async def t_classify_intent(
         }
         gender_term = gender_map.get(user_gender.lower(), "")
 
-    system_prompt = """
-You are an intent classifier for a fashion search bot.
+    # CRITICAL: Make the prompt EXTREMELY explicit about JSON format
+    system_prompt = """You are a fashion search intent classifier.
 
-You must return ONLY a JSON object with this exact schema (no extra text, no explanations):
+YOUR ONLY JOB: Output a valid JSON object. Nothing else. No explanations. No markdown. Just pure JSON.
 
+REQUIRED OUTPUT FORMAT (copy this structure exactly):
 {
-  "search_type": "specific" | "discovery" | "pairing",
-  "queries": ["string", "string", ...]
+  "search_type": "specific",
+  "queries": ["query1", "query2", "query3"]
 }
 
-CRITICAL RULES FOR QUERY GENERATION:
-- "specific": Return exactly 1 query
-- "discovery": Return exactly 3 DIFFERENT queries that are variations of the concept
-- "pairing": Return exactly 3 DIFFERENT complementary item queries
+RULES FOR search_type:
+- "specific": User wants one exact item → output 1 query
+- "discovery": User wants to explore options → output 3 DIFFERENT queries
+- "pairing": User wants matching items → output 3 DIFFERENT complementary queries
 
-For DISCOVERY, you MUST generate 3 diverse but related queries. Examples:
+RULES FOR queries:
+- Keep SHORT: "Material Color Item" format
+- Examples: "Cotton Shorts", "Navy Trousers", "Floral Dress", "White Shirt"
+- For discovery: 3 variations (different materials/colors/styles)
+  Example: ["Cotton formal shirts", "Linen casual shirts", "Printed office shirts"]
+- For pairing: 3 complementary items (different but matching)
+  Example: ["White cotton shirts", "Light blue shirts", "Beige linen shirts"]
+- NO price words, NO location, NO empty strings
+- ALWAYS return 3 queries for discovery/pairing, 1 for specific
 
-BAD (discovery):
-{"search_type": "discovery", "queries": ["Cotton formal shirts"]}  ❌ Only 1 query!
+CRITICAL: Your response must be ONLY the JSON object. Start with { and end with }. Nothing before or after.
 
-GOOD (discovery):
-{"search_type": "discovery", "queries": [
-  "Cotton formal shirts",
-  "Linen casual shirts", 
-  "Printed office shirts"
-]}  ✅ 3 diverse queries!
+EXAMPLES:
 
-For PAIRING, generate 3 different items that complement. Examples:
+Input: {"query": "blue shirt"}
+Output: {"search_type": "specific", "queries": ["Blue shirt"]}
 
-BAD (pairing for "navy trousers"):
-{"search_type": "pairing", "queries": ["Shirts"]}  ❌ Only 1!
+Input: {"query": "shirts for office"}
+Output: {"search_type": "discovery", "queries": ["Cotton formal shirts", "Linen casual shirts", "Printed office shirts"]}
 
-GOOD (pairing for "navy trousers"):
-{"search_type": "pairing", "queries": [
-  "White cotton shirts",
-  "Pastel linen shirts",
-  "Light blue formal shirts"
-]}  ✅ 3 diverse options!
+Input: {"query": "what goes with navy trousers"}
+Output: {"search_type": "pairing", "queries": ["White cotton shirts", "Light blue formal shirts", "Beige casual shirts"]}
 
-Rules for ALL queries:
-- They must be SIMPLE, DIRECT fashion product search strings
-- Examples: "Cotton Shorts", "Navy Trousers", "Beige T-Shirt", "Floral Dress"
-- Only clothing, footwear, accessories
-- If gender specified, append naturally (e.g., "Blue Shirt for men")
-- NO price words, NO "India", NO "Trending", NO generic prompts
-
-Remember: `queries` MUST be short and diverse!
-""".strip()
+Remember: ONLY output the JSON object. No text before or after.""".strip()
 
     try:
-        # Build user content with gender context
-        user_content = {"query": query}
+        # Build user content
+        user_content_dict = {"query": query}
         if gender_term:
-            user_content["gender_context"] = gender_term
+            user_content_dict["gender_context"] = gender_term
         if forced_type:
-            user_content["forced_type"] = forced_type
+            user_content_dict["forced_type"] = forced_type
+            user_content_dict["note"] = f"Force search_type to be '{forced_type}'"
         
+        user_content = json.dumps(user_content_dict)
+
+        # Call Responses API (NO response_format parameter)
         response = await asyncio.to_thread(
             client.responses.create,
             model=Config.FAST_MODEL,
             input=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_content)},
+                {"role": "user", "content": user_content},
             ],
-            max_output_tokens=250,  # Increase to allow 3 queries
+            max_output_tokens=500,  # Increased for safety
         )
 
         raw_text = (response.output_text or "").strip()
-        parsed: Optional[Dict[str, Any]] = None
+        
+        if not raw_text:
+            logger.warning("⚠️ Empty response from LLM")
+            raise ValueError("Empty response from LLM")
+        
+        logger.debug("🔍 classify_intent RAW OUTPUT", raw_text=raw_text[:300])
 
-        if raw_text:
-            try:
-                parsed = json.loads(raw_text)
-            except Exception as e:
-                logger.error("❌ classify_intent JSON parse failed", raw=raw_text, error=str(e))
-
+        # Aggressive JSON extraction
+        parsed = None
+        
+        # Method 1: Try direct parse
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            pass
+        
+        # Method 2: Remove markdown if present
         if not parsed:
-            result = {"search_type": "specific", "queries": [query]}
-            await INTENT_CACHE.set(cache_key, result)
-            return result
+            clean_text = raw_text
+            if "```json" in clean_text:
+                clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in clean_text:
+                clean_text = clean_text.split("```")[1].split("```")[0].strip()
+            
+            try:
+                parsed = json.loads(clean_text)
+            except json.JSONDecodeError:
+                pass
+        
+        # Method 3: Find JSON object boundaries
+        if not parsed:
+            try:
+                start_idx = raw_text.find("{")
+                end_idx = raw_text.rfind("}")
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    json_str = raw_text[start_idx : end_idx + 1]
+                    parsed = json.loads(json_str)
+            except json.JSONDecodeError:
+                pass
+        
+        # If all parsing failed, log and use fallback
+        if not parsed:
+            logger.error("❌ All JSON parsing methods failed", raw=raw_text[:200])
+            raise ValueError("Could not parse JSON from response")
 
-        search_type = parsed.get("search_type", "specific")
+        # Extract and validate fields
+        search_type = parsed.get("search_type", "discovery")
+        
+        # Override with forced_type if provided
         if forced_type in ("specific", "discovery", "pairing"):
             search_type = forced_type
+        
+        # Validate search_type
+        if search_type not in ("specific", "discovery", "pairing"):
+            logger.warning(f"⚠️ Invalid search_type '{search_type}', defaulting to discovery")
+            search_type = "discovery"
+        
+        queries = parsed.get("queries", [])
+        
+        # Validate queries is a list
+        if not isinstance(queries, list):
+            queries = [str(queries)] if queries else [query]
+        
+        # Clean empty/invalid queries
+        queries = [
+            q.strip() 
+            for q in queries 
+            if q and isinstance(q, str) and q.strip()
+        ]
+        
+        if not queries:
+            logger.warning("⚠️ No valid queries after cleaning, using original")
+            queries = [query]
 
-        queries = parsed.get("queries", [query])
-
-        # 🆕 ENFORCE 3 queries for discovery/pairing
+        # Enforce query count rules
         if search_type in ("discovery", "pairing"):
             if len(queries) < 3:
                 logger.warning(f"⚠️ Only {len(queries)} queries for {search_type}, expanding...")
-                # Expand with variations
                 base = queries[0] if queries else query
-                if search_type == "discovery":
-                    # Generate material/style variations
-                    variations = [
-                        base,
-                        base.replace("Cotton", "Linen").replace("cotton", "linen"),
-                        base.replace("formal", "casual").replace("Formal", "Casual")
-                    ]
-                    queries = list(dict.fromkeys(variations))[:3]  # Dedupe
-                else:  # pairing
-                    # Generate color variations
-                    colors = ["White", "Light blue", "Pastel"]
-                    queries = [f"{color} {base}" for color in colors]
+                expanded = list(queries)
                 
-                logger.info(f"📝 Expanded to: {queries}")
+                if search_type == "discovery":
+                    # Material/style variations
+                    variations = [
+                        f"Cotton {base}",
+                        f"Linen {base}",
+                        f"Printed {base}",
+                        f"Solid {base}",
+                        f"Silk {base}",
+                    ]
+                else:  # pairing
+                    # Color variations
+                    variations = [
+                        f"White {base}",
+                        f"Black {base}",
+                        f"Navy {base}",
+                        f"Beige {base}",
+                        f"Light blue {base}",
+                    ]
+                
+                for var in variations:
+                    if len(expanded) >= 3:
+                        break
+                    if var not in expanded:
+                        expanded.append(var)
+                
+                queries = expanded[:3]
+                logger.info(f"📝 Expanded to {len(queries)} queries: {queries}")
             else:
                 queries = queries[:3]
-        else:
+        else:  # specific
             queries = queries[:1]
 
         result = {"search_type": search_type, "queries": queries}
@@ -982,13 +1047,24 @@ Remember: `queries` MUST be short and diverse!
             queries=queries,
         )
         return result
+        
     except Exception as e:
         ms = int((time.perf_counter() - t0) * 1000)
         logger.error("❌ classify_intent failed", duration_ms=ms, error=str(e))
-        result = {"search_type": "specific", "queries": [query]}
-        await INTENT_CACHE.set(cache_key, result)
+        logger.error(traceback.format_exc())
+        
+        # Smart fallback based on forced_type or query analysis
+        s_type = forced_type if forced_type else "discovery"
+        
+        if s_type == "specific":
+            q_list = [query]
+        elif s_type == "discovery":
+            q_list = [query, f"Printed {query}", f"Solid {query}"]
+        else:  # pairing
+            q_list = [f"White {query}", f"Navy {query}", f"Beige {query}"]
+        
+        result = {"search_type": s_type, "queries": q_list}
         return result
-
 
 # =============================================================================
 # Catalog search helpers
