@@ -2,7 +2,90 @@
 
 import gradio as gr
 import asyncio
-from responses_agent import run_conversation_stream
+import json
+from typing import Any, Dict, List, Optional, Tuple
+
+from responses_agent import run_conversation_stream, logger as agent_logger
+
+
+META_CHUNK_PREFIX = "__META__"
+LEGACY_PRODUCTS_PREFIX = "__PRODUCTS__"
+LEGACY_OPTIONS_PREFIX = "__OPTIONS__"
+PLACEHOLDER_IMAGE = "https://via.placeholder.com/300?text=No+Image"
+
+def _parse_stream_chunk(chunk: str) -> Tuple[Optional[str], Any]:
+    """
+    Inspect a streamed chunk and return (type, payload) for metadata chunks.
+    """
+    if not isinstance(chunk, str):
+        return None, None
+
+    if chunk.startswith(META_CHUNK_PREFIX):
+        raw = chunk[len(META_CHUNK_PREFIX):]
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            agent_logger.warning("UI meta chunk decode failed", error=str(exc))
+            return None, None
+        return payload.get("type"), payload.get("data")
+
+    if chunk.startswith(LEGACY_PRODUCTS_PREFIX):
+        raw = chunk[len(LEGACY_PRODUCTS_PREFIX):]
+        try:
+            return "products", json.loads(raw)
+        except json.JSONDecodeError as exc:
+            agent_logger.warning("Legacy products chunk decode failed", error=str(exc))
+            return None, None
+
+    if chunk.startswith(LEGACY_OPTIONS_PREFIX):
+        raw = chunk[len(LEGACY_OPTIONS_PREFIX):]
+        try:
+            return "options", json.loads(raw)
+        except json.JSONDecodeError as exc:
+            agent_logger.warning("Legacy options chunk decode failed", error=str(exc))
+            return None, None
+
+    return None, None
+
+
+def _format_gallery_data(products: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    """
+    Convert product dicts into gallery tuples expected by gr.Gallery.
+    """
+    gallery_data: List[Tuple[str, str]] = []
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        image = (
+            product.get("image_url")
+            or product.get("image")
+            or PLACEHOLDER_IMAGE
+        )
+        name = product.get("title") or product.get("name") or "Product"
+        price = product.get("price_inr")
+        if price in (None, "", 0):
+            price = product.get("price")
+        caption = name
+        if price not in (None, "", 0):
+            caption = f"{name}\n(Rs. {price})"
+        gallery_data.append((image, str(caption)))
+    return gallery_data
+
+
+def _format_option_samples(options: List[Any]) -> List[List[str]]:
+    """
+    Prepare dataset samples for clickable chips.
+    """
+    samples: List[List[str]] = []
+    for option in options:
+        if option is None:
+            continue
+        text = str(option).strip()
+        if not text:
+            continue
+        samples.append([text])
+    return samples
+
 
 async def add_user_message(user_message, history):
     """
@@ -39,62 +122,61 @@ async def bot_response(history, user_id):
     history.append({"role": "assistant", "content": ack_text})
     yield history, None, None
 
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.2)
 
     # 2. Prepare for the Real Response (New Bubble)
-    # Start with a typing indicator
     history.append({"role": "assistant", "content": "..."})
-    yield history, None, gr.update(visible=True)
+    gallery_reset = gr.update(value=None, visible=False)
+    chips_reset = gr.update(samples=[], visible=False)
+    yield history, gallery_reset, chips_reset
     
     full_response = ""
-    products = []
-    options = []
-    import json
+    products: List[Dict[str, Any]] = []
+    options: List[Any] = []
     
     async for chunk in generator:
-        # Check for hidden product data
-        if chunk.startswith("__PRODUCTS__"):
-            try:
-                products_json = chunk.replace("__PRODUCTS__", "")
-                products = json.loads(products_json)
-            except Exception:
-                pass
+        chunk_type, payload = _parse_stream_chunk(chunk)
+        if chunk_type == "products":
+            if isinstance(payload, list):
+                products = payload
+                agent_logger.info("UI received products", count=len(products))
+            else:
+                agent_logger.warning(
+                    "Products payload was not a list",
+                    payload_type=type(payload).__name__,
+                )
             continue
-            
-        if chunk.startswith("__OPTIONS__"):
-            try:
-                options_json = chunk.replace("__OPTIONS__", "")
-                options = json.loads(options_json)
-            except Exception:
-                pass
-            continue
-            
-        full_response += chunk
-        # Update the LAST message (the real response)
-        history[-1]["content"] = full_response
-        yield history, None, gr.update(visible=True)
 
-    # After stream ends, if we have products, show them
+        if chunk_type == "options":
+            if isinstance(payload, list):
+                options = payload
+                agent_logger.info("UI received options", count=len(options))
+            else:
+                agent_logger.warning(
+                    "Options payload was not a list",
+                    payload_type=type(payload).__name__,
+                )
+            continue
+
+        full_response += chunk
+        history[-1]["content"] = full_response
+        yield history, None, None
+
+    gallery_update = gr.update(value=None, visible=False)
     if products:
-        # Format for Gallery: list of (image_url, caption) tuples
-        # Ensure we have valid images
-        gallery_data = []
-        for p in products:
-            img = p.get("image_url") or p.get("image") or "https://via.placeholder.com/300?text=No+Image"
-            name = p.get("title") or p.get("name") or "Product"
-            price = p.get("price_inr") or p.get("price")
-            caption = f"{name}\n(₹{price})" if price else name
-            gallery_data.append((img, caption))
-            
-        yield history, gallery_data, gr.update(visible=True)
-        
-    # If options found, update the dataset
+        gallery_update = gr.update(
+            value=_format_gallery_data(products),
+            visible=True,
+        )
+
+    chips_update = gr.update(samples=[], visible=False)
     if options:
-        # Dataset expects a list of lists: [['Option 1'], ['Option 2']]
-        samples = [[opt] for opt in options]
-        yield history, None, gr.update(samples=samples, visible=True)
-    else:
-        yield history, None, gr.update(samples=[], visible=False)
+        chips_update = gr.update(
+            samples=_format_option_samples(options),
+            visible=True,
+        )
+
+    yield history, gallery_update, chips_update
 
 with gr.Blocks(title="🎨 MuseBot — Fashion Assistant", theme=gr.themes.Soft()) as demo:
     gr.Markdown(

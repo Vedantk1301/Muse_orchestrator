@@ -13,7 +13,8 @@ import asyncio
 import time
 import hashlib
 import traceback
-from typing import Any, Dict, List, Optional, AsyncGenerator
+from collections import OrderedDict
+from typing import Any, Dict, List, Optional, AsyncGenerator, Set
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,6 +23,8 @@ from urllib.parse import quote_plus
 import requests
 from openai import OpenAI
 from dotenv import load_dotenv
+
+from gpt_based import search_fashion_with_web
 
 load_dotenv()
 
@@ -112,7 +115,7 @@ class Config:
     REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low")
 
     MAX_TOOL_CALLS = int(os.getenv("MAX_TOOL_CALLS", "10"))
-    MAX_LATENCY_MS = int(os.getenv("MAX_LATENCY_MS", "15000"))
+    MAX_LATENCY_MS = int(os.getenv("MAX_LATENCY_MS", "45000"))
 
     CATALOG_COLLECTION = os.getenv("CATALOG_COLLECTION", "fashion_qwen4b_text")
     HNSW_EF = int(os.getenv("HNSW_EF", "500"))
@@ -121,6 +124,11 @@ class Config:
     DISCOVERY_QUERIES = 3
     PRODUCTS_PER_QUERY = 40
     FINAL_RERANK_TOP_K = 16
+    DISPLAY_PRODUCTS_COUNT = int(os.getenv("DISPLAY_PRODUCTS_COUNT", "8"))
+    MIN_PRODUCTS_TARGET = int(os.getenv("MIN_PRODUCTS_TARGET", "8"))
+    NUMERIC_RERANK_POOL = int(os.getenv("NUMERIC_RERANK_POOL", "30"))
+    LLM_RERANK_INPUT_LIMIT = int(os.getenv("LLM_RERANK_INPUT_LIMIT", "20"))
+    WEB_TOPUP_MIN_COUNT = int(os.getenv("WEB_TOPUP_MIN_COUNT", "2"))
 
     SEARCH_CACHE_TTL_HOURS = 24
     INTENT_CACHE_TTL_SECONDS = 1800
@@ -143,6 +151,9 @@ client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
 # Trend cache on disk (JSON)
 TREND_CACHE_FILE = Path(os.getenv("TREND_CACHE_FILE", "cache/fashion_trends.json"))
+
+# Streaming metadata prefix
+META_CHUNK_PREFIX = "__META__"
 
 # =============================================================================
 # TTL Cache
@@ -590,6 +601,8 @@ class Budget:
     # keep last search output for frontend
     last_search_result: Dict[str, Any] = field(default_factory=dict)
     last_products: List[Dict[str, Any]] = field(default_factory=list)
+    aggregated_products: "OrderedDict[str, Dict[str, Any]]" = field(default_factory=OrderedDict)
+    last_options: List[str] = field(default_factory=list)
 
     def can_call(self, tool_name: str = "") -> bool:
         has_budget = (
@@ -633,8 +646,61 @@ class Budget:
             "calls_used": self.calls_used,
             "latency_ms": self.latency_ms,
             "tool_log": self.tool_log,
-            "last_options": getattr(self, "last_options", []),
+            "last_options": self.last_options,
         }
+
+    def record_products(self, products: List[Dict[str, Any]]):
+        """
+        Track products returned across multiple tool calls so the frontend
+        can render everything the assistant referenced.
+        """
+        if not products:
+            return
+
+        self.last_products = products
+        for product in products:
+            key = self._product_key(product)
+            if key not in self.aggregated_products:
+                self.aggregated_products[key] = product
+
+    def set_options(self, options: List[str]):
+        """
+        Track the most recent set of options/suggestions to surface in the UI.
+        """
+        cleaned = []
+        for option in options:
+            if option is None:
+                continue
+            text = str(option).strip()
+            if not text:
+                continue
+            cleaned.append(text)
+        if cleaned:
+            self.last_options = cleaned
+
+    def _product_key(self, product: Dict[str, Any]) -> str:
+        pid = (
+            product.get("product_id")
+            or product.get("id")
+            or product.get("url")
+        )
+        if pid:
+            return str(pid)
+
+        # Fallback to a stable hash when no obvious identifier exists
+        raw = json.dumps(product, sort_keys=True, default=str)
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    def get_all_products(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        aggregated = list(self.aggregated_products.values())
+        if not aggregated:
+            aggregated = list(self.last_products)
+
+        if limit is not None and aggregated:
+            return aggregated[:limit]
+        return aggregated
+
+
 # =============================================================================
 # Profile tools (kept internal for future use)
 # =============================================================================
@@ -774,8 +840,8 @@ async def t_classify_intent(
     - For discovery or pairing, always returns 3 short SKU like queries.
     - Queries MUST be fashion / catalog friendly only (no 'under 5000', no generic chit chat).
     """
-    # Ignore gender for now, we want fully neutral behaviour
-    user_gender = None
+    # Use gender if provided
+    # user_gender = None
 
     cache_key = _cache_key("intent", query.lower(), forced_type or "")
     cached = await INTENT_CACHE.get(cache_key)
@@ -908,30 +974,284 @@ Remember:
 
 
 # =============================================================================
-# Product search (Qdrant) – multi-query, parallel, fashion-only
+# Catalog search helpers
+# =============================================================================
+def _product_identity(product: Dict[str, Any]) -> Optional[str]:
+    return (
+        product.get("product_id")
+        or product.get("id")
+        or product.get("url")
+    )
+
+
+def _interleave_results(results_lists: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    if not results_lists:
+        return []
+
+    max_len = max(len(lst) for lst in results_lists)
+    seen: Set[str] = set()
+    combined: List[Dict[str, Any]] = []
+
+    for i in range(max_len):
+        for lst in results_lists:
+            if i >= len(lst):
+                continue
+            product = lst[i]
+            pid = _product_identity(product)
+            if pid and pid in seen:
+                continue
+            if pid:
+                seen.add(pid)
+            combined.append(product)
+    return combined
+
+
+def _dedupe_products(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    for product in products:
+        pid = _product_identity(product)
+        if not pid:
+            pid = f"anon::{hashlib.md5(json.dumps(product, sort_keys=True).encode('utf-8')).hexdigest()}"
+        if pid in seen:
+            continue
+        seen.add(pid)
+        deduped.append(product)
+    return deduped
+
+
+async def _numeric_rerank_products(user_query: str, products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if len(products) <= 1:
+        return products
+
+    pool_limit = min(Config.NUMERIC_RERANK_POOL, len(products))
+    pool = products[:pool_limit]
+    remainder = products[pool_limit:]
+
+    texts = [
+        f"{p.get('title') or ''} {p.get('brand') or ''} {p.get('category') or ''}".strip()
+        for p in pool
+    ]
+    rerank_t0 = time.perf_counter()
+    try:
+        indices = await Services.rerank(
+            user_query,
+            texts,
+            top_k=min(len(pool), Config.NUMERIC_RERANK_POOL),
+        )
+        ordered: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+
+        for idx in indices or []:
+            if idx is None or not (0 <= idx < len(pool)):
+                continue
+            product = pool[idx]
+            pid = _product_identity(product)
+            if pid and pid in seen:
+                continue
+            if pid:
+                seen.add(pid)
+            ordered.append(product)
+
+        for product in pool:
+            pid = _product_identity(product)
+            if pid and pid in seen:
+                continue
+            if pid:
+                seen.add(pid)
+            ordered.append(product)
+
+        ordered.extend(remainder)
+        rerank_ms = int((time.perf_counter() - rerank_t0) * 1000)
+        logger.perf(
+            "rerank_vector",
+            rerank_ms,
+            pool=len(pool),
+            total=len(products),
+        )
+        return ordered
+    except Exception as e:
+        logger.warning("Vector rerank failed", error=str(e))
+        return products
+
+
+async def _llm_rerank_products(
+    user_query: str,
+    products: List[Dict[str, Any]],
+    min_results: int,
+) -> List[Dict[str, Any]]:
+    if len(products) <= 1:
+        return products
+
+    candidates = products[: Config.LLM_RERANK_INPUT_LIMIT]
+    payload_products = []
+    for product in candidates:
+        payload_products.append(
+            {
+                "id": str(_product_identity(product)),
+                "title": product.get("title"),
+                "brand": product.get("brand"),
+                "category_leaf": product.get("category") or product.get("category_leaf"),
+                "score": round(float(product.get("score", 0.0)), 4),
+                "source": product.get("from_query") or product.get("source") or "catalog",
+            }
+        )
+
+    system_prompt = """
+You are a ranking model for a fashion shopping assistant.
+Reorder the candidate products so that the top items best match the user request.
+- Drop only the products that are clearly irrelevant.
+- If at least `min_results` items are relevant, return at least that many.
+- Preserve the IDs exactly as provided.
+- Respond ONLY with a JSON object:
+  {"ordered_ids": ["id1", "id2", ...]}
+""".strip()
+
+    llm_t0 = time.perf_counter()
+    try:
+        response = await asyncio.to_thread(
+            client.responses.create,
+            model=Config.FAST_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "user_query": user_query,
+                            "min_results": min_results,
+                            "products": payload_products,
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            max_output_tokens=400,
+        )
+        raw_text = (response.output_text or "").strip()
+        data = {}
+        if raw_text:
+            try:
+                data = json.loads(raw_text)
+            except json.JSONDecodeError:
+                start = raw_text.find("{")
+                end = raw_text.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    data = json.loads(raw_text[start : end + 1])
+        ordered_ids = data.get("ordered_ids") or data.get("products") or []
+        id_map = {str(_product_identity(p)): p for p in candidates}
+        ordered: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+
+        for pid in ordered_ids:
+            pid = str(pid)
+            product = id_map.get(pid)
+            if not product:
+                continue
+            if pid in seen:
+                continue
+            seen.add(pid)
+            ordered.append(product)
+
+        for pid, product in id_map.items():
+            if pid in seen:
+                continue
+            ordered.append(product)
+
+        llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+        logger.perf(
+            "rerank_llm",
+            llm_ms,
+            in_count=len(candidates),
+            out_count=len(ordered),
+        )
+        return ordered
+    except Exception as e:
+        logger.warning("LLM rerank failed", error=str(e))
+        return products
+
+
+async def _fetch_web_topup_products(
+    user_query: str,
+    existing_keys: Set[str],
+    needed: int,
+) -> List[Dict[str, Any]]:
+    if needed <= 0:
+        return []
+
+    request_count = max(needed, Config.WEB_TOPUP_MIN_COUNT)
+    web_t0 = time.perf_counter()
+    try:
+        web_results = await asyncio.to_thread(
+            search_fashion_with_web,
+            user_query,
+            request_count,
+        )
+        web_ms = int((time.perf_counter() - web_t0) * 1000)
+        logger.perf(
+            "web_search_topup",
+            web_ms,
+            requested=request_count,
+            received=len(web_results),
+        )
+    except Exception as e:
+        logger.error("web_search_topup_failed", error=str(e))
+        return []
+
+    mapped: List[Dict[str, Any]] = []
+    for idx, item in enumerate(web_results):
+        url = (item.get("sourceUrl") or "").strip()
+        name = (item.get("name") or "").strip()
+        if not url and not name:
+            continue
+        pid_seed = url or f"{name}-{idx}"
+        pid = f"web::{hashlib.md5(pid_seed.encode('utf-8')).hexdigest()}"
+        if pid in existing_keys or (url and url in existing_keys):
+            continue
+
+        product = {
+            "id": pid,
+            "product_id": pid,
+            "title": name or "Web product",
+            "brand": item.get("tone") or "Web",
+            "category": item.get("description"),
+            "image_url": item.get("imageUrl"),
+            "url": url or item.get("sourceUrl"),
+            "price": item.get("price"),
+            "price_inr": item.get("price"),
+            "score": 0.0,
+            "from_query": "web_search",
+            "source": "web",
+        }
+        mapped.append(product)
+        if pid:
+            existing_keys.add(pid)
+        if url:
+            existing_keys.add(url)
+
+        if len(mapped) >= needed:
+            break
+
+    return mapped
+
+
+# =============================================================================
+# Catalog search
 # =============================================================================
 async def t_search_fashion_products(
-    query: str, user_gender: Optional[str] = None, search_type: str = "auto"
+    query: str,
+    user_gender: Optional[str] = None,
+    category_filter: Optional[str] = None,
+    search_type: str = "auto",
 ) -> Dict[str, Any]:
     """
-    Product search tool (card-friendly).
-
-    Returns:
-        {
-          "products": [...],
-          "total_found": int,
-          "search_type": "specific" | "discovery" | "pairing",
-          "queries_used": [...],
-          "best_score": float
-        }
-
-    Behaviour:
     - Always treats searches as gender neutral internally.
     - For discovery / pairing: expands to 3 short fashion-only queries and runs them in PARALLEL.
     - Combines products from all queries, dedupes by product id, then reranks (if needed).
     """
-    # We always treat searches as gender neutral internally
-    user_gender = None
+    # Use gender if provided
+    # user_gender = None
 
     cache_key = _cache_key("search", query.lower(), search_type)
     cached = await SEARCH_CACHE.get(cache_key)
@@ -986,6 +1306,14 @@ async def t_search_fashion_products(
                     ),
                     with_payload=True,
                     search_params=rest.SearchParams(hnsw_ef=Config.HNSW_EF),
+                    query_filter=rest.Filter(
+                        must=[
+                            rest.FieldCondition(
+                                key="category_path",
+                                match=rest.MatchText(text=category_filter),
+                            )
+                        ]
+                    ) if category_filter else None,
                 )
 
             return await asyncio.to_thread(_do)
@@ -998,11 +1326,8 @@ async def t_search_fashion_products(
         search_ms = int((time.perf_counter() - search_t0) * 1000)
         logger.perf("qdrant_search", search_ms, num_queries=len(queries))
 
-        # Aggregate products → CARD FORMAT
-        # Interleave results from multiple queries to ensure diversity
-        # e.g. [Q1_1, Q2_1, Q3_1, Q1_2, Q2_2, Q3_2, ...]
-        
-        results_lists = []
+        # Aggregate products + candidate preparation
+        results_lists: List[List[Dict[str, Any]]] = []
         best_score = 0.0
         per_query = (
             min(Config.FINAL_RERANK_TOP_K * 2, Config.PRODUCTS_PER_QUERY)
@@ -1014,98 +1339,110 @@ async def t_search_fashion_products(
             if isinstance(result, Exception):
                 logger.warning(f"Query {i} failed", error=str(result))
                 continue
-            
-            q_products = []
+
+            q_products: List[Dict[str, Any]] = []
             for point in (result.points or [])[:per_query]:
                 payload = point.payload or {}
-                commerce = payload.get("commerce") or {}
+                commerce = payload.get('commerce') or {}
                 pid = (
-                    payload.get("product_id")
-                    or payload.get("id")
-                    or getattr(point, "id", None)
+                    payload.get('product_id')
+                    or payload.get('id')
+                    or getattr(point, 'id', None)
                 )
                 if not pid:
                     continue
-                    
+                pid = str(pid)
+
                 score = float(point.score)
                 best_score = max(best_score, score)
 
                 card = {
-                    "id": pid,
-                    "product_id": pid,
-                    "title": payload.get("title"),
-                    "brand": payload.get("brand"),
-                    "category": payload.get("category_leaf"),
-                    "image_url": payload.get("primary_image")
-                    or payload.get("image_url"),
-                    "url": payload.get("url"),
-                    "price": commerce.get("price"),
-                    "price_inr": commerce.get("price_inr"),
-                    "score": score,
-                    "from_query": q,
+                    'id': pid,
+                    'product_id': pid,
+                    'title': payload.get('title'),
+                    'brand': payload.get('brand'),
+                    'category': payload.get('category_leaf'),
+                    'category_leaf': payload.get('category_leaf'),
+                    'category_path': payload.get('category_path'),
+                    'image_url': payload.get('primary_image')
+                    or payload.get('image_url'),
+                    'url': payload.get('url'),
+                    'price': commerce.get('price'),
+                    'price_inr': commerce.get('price_inr'),
+                    'score': score,
+                    'from_query': q,
+                    'source_tags': payload.get('source_tags') or [],
                 }
                 q_products.append(card)
             results_lists.append(q_products)
 
-        # Interleave
-        all_products: List[Dict[str, Any]] = []
-        seen_ids = set()
-        
-        if not results_lists:
-            pass
-        else:
-            max_len = max(len(lst) for lst in results_lists)
-            for i in range(max_len):
-                for lst in results_lists:
-                    if i < len(lst):
-                        p = lst[i]
-                        if p["id"] not in seen_ids:
-                            seen_ids.add(p["id"])
-                            all_products.append(p)
+        interleaved = _interleave_results(results_lists)
+        candidates = _dedupe_products(interleaved)
+        total_candidates = len(candidates)
 
-        # Only sort by score if we have a SINGLE query. 
-        # If multiple, we trust the interleaving to provide better relevance/diversity mix.
         if len(queries) == 1:
-            all_products.sort(key=lambda x: x["score"], reverse=True)
+            candidates.sort(key=lambda x: x.get('score', 0.0), reverse=True)
 
         logger.debug(
-            "📦 Aggregated products", count=len(all_products), best_score=best_score
+            'Aggregated products',
+            count=total_candidates,
+            best_score=best_score,
         )
 
-        # Optional rerank
-        if all_products and best_score < Config.TAU_NO_RERANK:
-            rerank_t0 = time.perf_counter()
-            try:
-                texts = [
-                    f"{p.get('title') or ''} {p.get('brand') or ''} {p.get('category') or ''}"
-                    for p in all_products
-                ]
-                indices = await Services.rerank(
-                    query,
-                    texts,
-                    top_k=min(Config.FINAL_RERANK_TOP_K, len(texts)),
-                )
-                all_products = [
-                    all_products[i] for i in indices if i < len(all_products)
-                ]
-                rerank_ms = int((time.perf_counter() - rerank_t0) * 1000)
-                logger.perf("rerank", rerank_ms, num_products=len(all_products))
-            except Exception as e:
-                logger.warning("Rerank failed", error=str(e))
-                all_products = all_products[: Config.FINAL_RERANK_TOP_K]
-        else:
-            all_products = all_products[: Config.FINAL_RERANK_TOP_K]
-            logger.debug(
-                "⚡ Skipped rerank",
-                reason="high_confidence" if best_score >= Config.TAU_NO_RERANK else "no_products",
+        base_products = candidates
+        if base_products:
+            base_products = await _numeric_rerank_products(query, base_products)
+            base_products = _dedupe_products(base_products)
+
+        final_products = base_products
+        if final_products:
+            llm_ranked = await _llm_rerank_products(
+                query, final_products, Config.MIN_PRODUCTS_TARGET
             )
+            if llm_ranked:
+                final_products = llm_ranked
+
+        web_products: List[Dict[str, Any]] = []
+        if len(final_products) < Config.MIN_PRODUCTS_TARGET:
+            needed = Config.MIN_PRODUCTS_TARGET - len(final_products)
+            existing_keys = {
+                key
+                for key in (_product_identity(p) for p in final_products)
+                if key
+            }
+            web_products = await _fetch_web_topup_products(
+                query, existing_keys, needed
+            )
+            if web_products:
+                logger.info(
+                    'Using web search fallback',
+                    added=len(web_products),
+                    needed=needed,
+                )
+                base_with_web = _dedupe_products((base_products or []) + web_products)
+                reranked = await _llm_rerank_products(
+                    query, base_with_web, Config.MIN_PRODUCTS_TARGET
+                )
+                final_products = reranked or base_with_web
+            else:
+                logger.warning(
+                    'Web search fallback returned nothing',
+                    requested=needed,
+                )
+
+        storage_limit = max(Config.FINAL_RERANK_TOP_K, Config.DISPLAY_PRODUCTS_COUNT)
+        stored_products = final_products[:storage_limit]
+        display_products = stored_products[: Config.DISPLAY_PRODUCTS_COUNT]
 
         result_payload = {
-            "products": all_products,
-            "total_found": len(all_products),
+            "products": display_products,
+            "all_products": stored_products,
+            "total_found": len(final_products),
             "search_type": search_type,
             "queries_used": queries,
             "best_score": best_score,
+            "total_candidates": total_candidates,
+            "web_topup_count": len(web_products),
         }
 
         await SEARCH_CACHE.set(cache_key, result_payload)
@@ -1114,7 +1451,8 @@ async def t_search_fashion_products(
         logger.success(
             "✅ search completed",
             duration_ms=total_ms,
-            products=len(all_products),
+            displayed=len(display_products),
+            stored=len(stored_products),
             score=best_score,
         )
         return result_payload
@@ -1140,7 +1478,7 @@ async def t_generate_search_suggestions(
     query: str, context: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Generate 3–4 *refinement suggestions* to show AFTER products.
+    Generate 3-4 *refinement suggestions* to show AFTER products.
 
     These are NOT new search queries fired automatically.
     They are UI chips the user can click, like:
@@ -1290,6 +1628,7 @@ async def t_show_options(options: List[str]) -> Dict[str, Any]:
     logger.info("🔘 show_options", options=options)
     return {"options": options}
 
+
 TOOLS_MAP = {
     "search_fashion_products": t_search_fashion_products,
     "tone_reply": t_tone_reply,
@@ -1305,17 +1644,21 @@ TOOLS_SCHEMA = [
         "description": (
             "Smart fashion search backed ONLY by the internal catalog (Qdrant). "
             "Use this for any request that involves buying, showing, or recommending items. "
-            "CRITICAL: You must translate abstract vibes into SPECIFIC product queries. "
-            "BAD Query: 'masculine wardrobe staples', 'party wear', 'office outfit' "
-            "GOOD Query: 'White Linen Shirt', 'Navy Blue Chinos', 'Black Leather Boots', 'Beige Cotton Trousers' "
-            "The search engine only understands: Material, Color, Fit, Category, Pattern. "
-            "ALWAYS split a look into multiple specific queries if needed."
+            "Provide ONE tight fashion query (material + category + vibe) and the tool will auto-expand discovery/pairing cases into up to 3 short searches, dedupe, rerank (vector + LLM), and guarantee at least 8 strong products with web-search fallback when needed. "
+            "Do NOT call this repeatedly in the same reply unless the user clearly asks for a brand-new category or filter. "
+            "BAD Query: 'masculine wardrobe staples', 'party wear', 'office outfit'. "
+            "GOOD Query: 'White Linen Shirt', 'Navy Blue Chinos', 'Black Leather Boots', 'Beige Cotton Trousers'. "
+            "The search engine only understands: Material, Color, Fit, Category, Pattern."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
                 "user_gender": {"type": "string"},
+                "category_filter": {
+                    "type": "string",
+                    "description": "Optional category keyword to filter by (e.g. 'ethnic', 'traditional').",
+                },
                 "search_type": {
                     "type": "string",
                     "enum": ["auto", "specific", "discovery", "pairing"],
@@ -1398,8 +1741,10 @@ MUSE helps people discover Indian and global brands online, you are the friendly
 
 ASSUMPTIONS:
 - Assume the user is in India by default unless they clearly say otherwise.
-- Always style in a gender neutral way by default. Do not assume the user is a man or a woman.
-- Avoid saying "men" or "women" in your answers. Say "you", "fits", "pieces", "styles" instead.
+- You MUST determine the user's gender preference (Menswear, Womenswear, or Neutral) BEFORE searching.
+- EXCEPTION: Do NOT ask this in your very first "Hello" greeting. In the first greeting, just introduce yourself and ask for their name.
+- When the user asks for products (e.g. "I want shirts"), IF you don't know the gender yet, ask for it THEN (and use `show_options`).
+- Do NOT search until you have this preference.
 
 OVERALL UX VIBE:
 - Replies must be short and product forward.
@@ -1431,6 +1776,7 @@ OVERALL UX VIBE:
   - Prefer:
     - Cotton or linen kurtas, churidar or straight pants, Nehru or Modi jackets, bandhgalas, juttis or loafers.
     - You can still add 1 or 2 smart Western looks like chinos with a shirt, but ethnic should be visible.
+    - CRITICAL: When searching for these, you MUST set `category_filter='ethnic'` in `search_fashion_products`.
 - For normal “office”, “meeting”, “interview”:
   - Talk in terms of modern Indian office wear: shirts, chinos, minimal sneakers or loafers, sometimes blazers or suits.
 - For “travel to <city> in <month> or next week”:
@@ -1439,11 +1785,11 @@ OVERALL UX VIBE:
     - “Which month are you going, May vs December is very different”
 
 4) Product grounding:
-- The function “search_fashion_products” is your only source of real products, brands, and prices.
+- The function “search_fashion_products” is your only source of real products, brands, and prices. Call it ONCE per user ask; it already fans out discovery/pairing queries, reranks (vector + LLM), and guarantees at least 8 relevant products with a web-search fallback when the catalog is thin.
 - Never invent a brand or product that is not in the tool output.
 - When the products list is non empty:
-  - Treat them as valid matches.
-  - Show 4 to 10 bullets for discovery and 2 to 4 bullets for narrow requests.
+  - Treat them as valid matches and speak from that list.
+  - Show up to 8 bullets by default (the UI only displays the top 8). For broader discovery or if the user explicitly asks for more, you may reference additional cached products.
   - Bullet style must be aesthetic, for example:
     - “A crisp light blue cotton shirt from Rare Rabbit, sharp contrast with navy trousers for office days 🙂”
     - “A relaxed navy shacket from Cultstore, throw on over a tee and chinos for casual dates 😌”
@@ -1454,16 +1800,15 @@ OVERALL UX VIBE:
 
 5) Tool usage:
 - For any outfit, clothing, shoes, or shopping question:
-  - Call “search_fashion_products” early, even if information is incomplete.
-- For pairing questions like “what goes with my navy trousers or black jeans or kurta”:
-  - Use a neutral but relevant query, like “smart casual shirts India” or “knit polos for office India”.
-  - Do NOT lock into just one colour in the query, you can choose colours in the answer.
-- When building the search query string for the tool:
-  - Do NOT include words like “men” or “women”. Keep it gender neutral.
-  - You may use the word “unisex” if you want.
-  - Do NOT include price or budget words like “under 2000”, “under 5000”, “cheap”, “budget” inside the query, those are handled later via suggestions and follow up searches.
+  - Make ONE call to “search_fashion_products” early, even if information is incomplete. Let the tool handle its own multi-query fan-out and reranking; do not spam multiple calls in the same reply unless the user clearly asks for a totally different category later.
+- For pairing or discovery questions (e.g., “what goes with navy trousers”):
+  - Set `search_type="discovery"` (or leave it blank/auto) so the tool automatically generates 3 concise queries and reranks them.
+  - Use a neutral but relevant query phrase like “smart casual shirts India” or “knit polos for office India”, then pick colours in the answer.
+- When building the search query string:
+  - Keep it gender neutral (no “men/women”), “unisex” is OK.
+  - Do NOT include price or budget words like “under 2000”, “cheap”, “budget”; handle those via follow ups.
 - When the user refines with size, budget, colour, or vibe:
-  - You may call “search_fashion_products” again with an updated query.
+  - You may call “search_fashion_products” again with that new filter, otherwise reuse the cached products.
 - Weather:
   - If the user asks “what is the weather in <city> today or this week” or asks what to pack based on weather, you may call “get_weather”.
   - Use the weather only as a short helper line to adjust fabrics and layers.
@@ -1488,9 +1833,8 @@ OVERALL UX VIBE:
     - “By the way, what should I call you, you can skip if you like”
   - Ask at most once per conversation.
 - Presentation or gender vibe:
-  - You must treat styling as gender neutral unless the user explicitly says otherwise.
-  - Optionally, once per conversation, if it would change recommendations a lot:
-    - “Do you want me to style you more masculine, feminine, or keep it neutral”
+  - You MUST ask for gender preference at the start if unknown.
+  - Once known, stick to it for the session unless changed.
   - If the UI has buttons for gender, you can say:
     - “You can tap an option or just tell me”
 - The question about name or gender should be separate from other questions and not spammy.
@@ -1541,6 +1885,7 @@ IMPORTANT:
 - Each reply must have at least one or two sentences in total, or one sentence plus bullets plus a question.
 - Do not use the long dash character — anywhere in your reply. Prefer commas, full stops, and emojis instead.
 - Never use the rainbow emoji.
+
 """.strip()
 
 
@@ -1591,11 +1936,26 @@ async def _run_single_tool_call(tool_call, budget: Budget) -> Dict[str, Any]:
         # Capture last product search for frontend
         if name == "search_fashion_products" and isinstance(result, dict):
             budget.last_search_result = result
-            budget.last_products = result.get("products", []) or []
-            
-        # Capture options
+            source_products = result.get("all_products") or result.get("products") or []
+            budget.record_products(source_products)
+
+        # Capture options from show_options
         if name == "show_options" and isinstance(result, dict):
-            budget.last_options = result.get("options", [])
+            budget.set_options(result.get("options", []) or [])
+
+        # Capture refinement suggestions as options
+        if name == "generate_search_suggestions" and isinstance(result, dict):
+            suggestions = result.get("suggestions") or []
+            if isinstance(suggestions, list):
+                labels = []
+                for suggestion in suggestions:
+                    if isinstance(suggestion, dict):
+                        label = suggestion.get("label") or suggestion.get("text")
+                    else:
+                        label = suggestion
+                    if label:
+                        labels.append(label)
+                budget.set_options(labels)
 
         ms = int((time.perf_counter() - t0) * 1000)
         budget.consume(name or "unknown", ms, success=True)
@@ -1659,7 +2019,11 @@ async def run_conversation(
     conversation: List[Dict[str, Any]] = [
         {
             "role": "system",
-            "content": f"{SYSTEM_PROMPT}\n\nContext: UserID={user_id} | ThreadID={thread_id}",
+            "content": SYSTEM_PROMPT,
+        },
+        {
+            "role": "system",
+            "content": f"Context: UserID={user_id} | ThreadID={thread_id}",
         },
     ]
 
@@ -1791,30 +2155,97 @@ async def run_conversation(
             logger.perf("conversation_total", total_ms, **budget_summary)
             logger.save_perf()
 
+            await _ensure_fallback_options(budget, message)
+
             return {
                 "text": final_text,
-                "products": budget.last_products,
+                "products": budget.get_all_products(Config.DISPLAY_PRODUCTS_COUNT),
                 "search_result": budget.last_search_result,
-                "options": getattr(budget, "last_options", []),
+                "options": budget.last_options,
             }
 
         logger.warning("⚠️ Max iterations (8) reached")
+        await _ensure_fallback_options(budget, message)
         return {
             "text": "I got a bit carried away there 😅 Could you say it a bit simpler",
-            "products": budget.last_products,
+            "products": budget.get_all_products(Config.DISPLAY_PRODUCTS_COUNT),
             "search_result": budget.last_search_result,
-            "options": getattr(budget, "last_options", []),
+            "options": budget.last_options,
         }
 
     except Exception as e:
         total_ms = int((time.perf_counter() - conv_t0) * 1000)
         logger.error("❌ Conversation failed", duration_ms=total_ms, error=str(e))
+        await _ensure_fallback_options(budget, message)
         logger.error(traceback.format_exc())
         return {
             "text": "Oops, something went wrong on my side. Try once more 😅",
-            "products": budget.last_products,
+            "products": budget.get_all_products(Config.DISPLAY_PRODUCTS_COUNT),
             "search_result": budget.last_search_result,
+            "options": budget.last_options,
         }
+
+
+# =============================================================================
+# Streaming helpers
+# =============================================================================
+async def _ensure_fallback_options(budget: Budget, user_message: str):
+    """
+    Guarantee the UI receives some actionable options even if the model forgets
+    to call show_options / generate_search_suggestions.
+    """
+    if budget.last_options:
+        return
+
+    search_result = budget.last_search_result or {}
+    products = search_result.get("products") or budget.last_products
+    if not products:
+        return
+
+    queries = search_result.get("queries_used") or []
+    base_query = queries[0] if queries else user_message
+
+    context_parts = [
+        f"User message: {user_message}",
+    ]
+    if search_result.get("search_type"):
+        context_parts.append(f"Search type: {search_result['search_type']}")
+    if queries:
+        context_parts.append(f"Queries used: {', '.join(queries[:3])}")
+    context = " | ".join(context_parts)
+
+    try:
+        logger.info("Auto generating fallback options", query=base_query)
+        response = await t_generate_search_suggestions(query=base_query, context=context)
+    except Exception as e:
+        logger.warning("Fallback options generation failed", error=str(e))
+        return
+
+    suggestions = response.get("suggestions") or []
+    labels: List[str] = []
+    for item in suggestions:
+        label = None
+        if isinstance(item, dict):
+            label = item.get("label") or item.get("text")
+        else:
+            label = str(item)
+        if label:
+            labels.append(label)
+
+    if labels:
+        budget.set_options(labels)
+
+
+def _make_meta_chunk(kind: str, payload: Any) -> Optional[str]:
+    """
+    Wrap metadata payloads so the frontend can reliably parse non-text events.
+    """
+    try:
+        encoded = json.dumps({"type": kind, "data": payload}, ensure_ascii=False, default=str)
+        return f"{META_CHUNK_PREFIX}{encoded}"
+    except Exception as e:
+        logger.error("�?�,? Failed to encode stream metadata", kind=kind, error=str(e))
+        return None
 
 
 # =============================================================================
@@ -1835,14 +2266,14 @@ async def run_conversation_stream(
                 {
                     "role": "system",
                     "content": (
-                        "You are MuseBot, a Gen Z fashion enthusiast and bestie. \n"
-                        "Your goal: Acknowledge the user's message with high energy and slang. \n"
+                        "You are MuseBot, a helpful and stylish fashion assistant. \n"
+                        "Your goal: Acknowledge the user's message naturally and briefly. \n"
                         "Rules:\n"
-                        "1. If the user says 'Hello', 'Hi', 'Hey' AND it is the start: Reply with 'Yo!', 'Hey bestie!', 'What's good?'. \n"
-                        "2. If the user gives a task/preference or answers a question: Say 'Bet', 'Say less', 'On it', 'Gotcha', 'Ooh nice'. \n"
-                        "3. Max 5 words. No emojis (the main bot uses them). \n"
-                        "4. NEVER say 'I will help you' or 'Let us fix your fits'. Be cool.\n"
-                        "5. AVOID repetitive greetings like 'Hey bestie' if the conversation is already ongoing."
+                        "1. If the user says 'Hello', 'Hi', 'Hey': Reply with 'Hey there!', 'Hi!', 'Hello!'. \n"
+                        "2. If the user gives a task/preference: Say 'Got it', 'Sure', 'On it', 'Understood'. \n"
+                        "3. Max 5 words. An emoji or two to be used. \n"
+                        "4. NEVER say 'I will help you' or 'Let us fix your fits'. Be concise.\n"
+                        "5. Avoid overusing slang like 'Bet' or 'Say less' unless it fits perfectly. Keep it polite but modern."
                     ),
                 },
                 *[{"role": m["role"], "content": m["content"]} for m in history[-4:] if "role" in m and "content" in m], # Context for ACK
@@ -1870,7 +2301,7 @@ async def run_conversation_stream(
         logger.warning("⚠️ ACK generation failed", error=str(e))
         yield fallback_ack
 
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.1)
 
     logger.info("🤖 Starting full response")
     
@@ -1902,17 +2333,22 @@ async def run_conversation_stream(
     # Get final result to ensure we catch any exceptions
     final = await task
     
-    # Yield products as a special hidden chunk if available
+    # Yield metadata chunks so the UI can render products/options
     if isinstance(final, dict):
-        if final.get("products"):
-            import json
-            yield f"__PRODUCTS__{json.dumps(final['products'])}"
-            
-        if final.get("options"):
-            import json
-            yield f"__OPTIONS__{json.dumps(final['options'])}"
-    # We don't yield final['text'] here because it would duplicate what was streamed.
+        products = final.get("products") or []
+        if products:
+            chunk = _make_meta_chunk("products", products)
+            if chunk:
+                logger.debug("Streaming products metadata", count=len(products))
+                yield chunk
 
+        options = final.get("options") or []
+        if options:
+            chunk = _make_meta_chunk("options", options)
+            if chunk:
+                logger.debug("Streaming options metadata", count=len(options))
+                yield chunk
+    # We don't yield final['text'] here because it would duplicate what was streamed.
 
 
 # =============================================================================
