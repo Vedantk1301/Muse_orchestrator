@@ -13,6 +13,7 @@ import asyncio
 import time
 import hashlib
 import traceback
+import re
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, AsyncGenerator, Set
 from dataclasses import dataclass, field
@@ -121,8 +122,8 @@ class Config:
     HNSW_EF = int(os.getenv("HNSW_EF", "500"))
 
     SIMPLE_SEARCH_LIMIT = 15
-    DISCOVERY_QUERIES = 3
-    PRODUCTS_PER_QUERY = 40
+    DISCOVERY_QUERIES = int(os.getenv("DISCOVERY_QUERIES", "4"))
+    PRODUCTS_PER_QUERY = 60
     FINAL_RERANK_TOP_K = 16
     DISPLAY_PRODUCTS_COUNT = int(os.getenv("DISPLAY_PRODUCTS_COUNT", "8"))
     MIN_PRODUCTS_TARGET = int(os.getenv("MIN_PRODUCTS_TARGET", "8"))
@@ -603,6 +604,8 @@ class Budget:
     last_products: List[Dict[str, Any]] = field(default_factory=list)
     aggregated_products: "OrderedDict[str, Dict[str, Any]]" = field(default_factory=OrderedDict)
     last_options: List[str] = field(default_factory=list)
+    user_gender: Optional[str] = None  # 🆕 Add this
+
 
     def can_call(self, tool_name: str = "") -> bool:
         has_budget = (
@@ -649,16 +652,18 @@ class Budget:
             "last_options": self.last_options,
         }
 
-    def record_products(self, products: List[Dict[str, Any]]):
+    def record_products(
+        self,
+        display_products: List[Dict[str, Any]],
+        all_products: Optional[List[Dict[str, Any]]] = None,
+    ):
         """
-        Track products returned across multiple tool calls so the frontend
-        can render everything the assistant referenced.
+        Track product lists so the frontend can render the latest display set
+        while still caching a deeper pool for follow-ups.
         """
-        if not products:
-            return
-
-        self.last_products = products
-        for product in products:
+        self.last_products = display_products or []
+        source = all_products or display_products or []
+        for product in source:
             key = self._product_key(product)
             if key not in self.aggregated_products:
                 self.aggregated_products[key] = product
@@ -692,13 +697,10 @@ class Budget:
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
     def get_all_products(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        aggregated = list(self.aggregated_products.values())
-        if not aggregated:
-            aggregated = list(self.last_products)
-
-        if limit is not None and aggregated:
-            return aggregated[:limit]
-        return aggregated
+        base = list(self.last_products) or list(self.aggregated_products.values())
+        if limit is not None and base:
+            return base[:limit]
+        return base
 
 
 # =============================================================================
@@ -836,14 +838,8 @@ async def t_classify_intent(
     """
     Classify the fashion search intent. Uses FAST_MODEL (Responses API) and caches
     results. Uses plain JSON output for robustness.
-    - Always uses gender neutral language in queries.
-    - For discovery or pairing, always returns 3 short SKU like queries.
-    - Queries MUST be fashion / catalog friendly only (no 'under 5000', no generic chit chat).
     """
-    # Use gender if provided
-    # user_gender = None
-
-    cache_key = _cache_key("intent", query.lower(), forced_type or "")
+    cache_key = _cache_key("intent", query.lower(), forced_type or "", user_gender or "")
     cached = await INTENT_CACHE.get(cache_key)
     if cached:
         logger.debug("💾 intent cache HIT")
@@ -851,6 +847,16 @@ async def t_classify_intent(
 
     t0 = time.perf_counter()
     logger.info("🧠 classify_intent", query=query[:80], forced_type=forced_type)
+
+    # Map user_gender to simple terms for queries
+    gender_term = None
+    if user_gender:
+        gender_map = {
+            "menswear": "for men",
+            "womenswear": "for women",
+            "neutral": "",
+        }
+        gender_term = gender_map.get(user_gender.lower(), "")
 
     system_prompt = """
 You are an intent classifier for a fashion search bot.
@@ -862,52 +868,61 @@ You must return ONLY a JSON object with this exact schema (no extra text, no exp
   "queries": ["string", "string", ...]
 }
 
+CRITICAL RULES FOR QUERY GENERATION:
+- "specific": Return exactly 1 query
+- "discovery": Return exactly 3 DIFFERENT queries that are variations of the concept
+- "pairing": Return exactly 3 DIFFERENT complementary item queries
+
+For DISCOVERY, you MUST generate 3 diverse but related queries. Examples:
+
+BAD (discovery):
+{"search_type": "discovery", "queries": ["Cotton formal shirts"]}  ❌ Only 1 query!
+
+GOOD (discovery):
+{"search_type": "discovery", "queries": [
+  "Cotton formal shirts",
+  "Linen casual shirts", 
+  "Printed office shirts"
+]}  ✅ 3 diverse queries!
+
+For PAIRING, generate 3 different items that complement. Examples:
+
+BAD (pairing for "navy trousers"):
+{"search_type": "pairing", "queries": ["Shirts"]}  ❌ Only 1!
+
+GOOD (pairing for "navy trousers"):
+{"search_type": "pairing", "queries": [
+  "White cotton shirts",
+  "Pastel linen shirts",
+  "Light blue formal shirts"
+]}  ✅ 3 diverse options!
+
 Rules for ALL queries:
-- They must be SIMPLE, DIRECT fashion product search strings.
-- Examples: "Cotton Linen Shorts", "Navy Blue Trousers", "Beige Oversized T Shirt", "Floral Midi Dress".
-- Only talk about clothing, footwear, and accessories.
-- All queries must be gender neutral. Do NOT use words like "men", "women", "male", "female".
-  - You MAY use "unisex" if you want a neutral signal.
-- Do NOT include any price or budget words in queries.
-- Do NOT include generic prompts like "what is trending" or "good outfits".
-- Do NOT include non fashion topics like weather, politics, coding, AI, etc.
+- They must be SIMPLE, DIRECT fashion product search strings
+- Examples: "Cotton Shorts", "Navy Trousers", "Beige T-Shirt", "Floral Dress"
+- Only clothing, footwear, accessories
+- If gender specified, append naturally (e.g., "Blue Shirt for men")
+- NO price words, NO "India", NO "Trending", NO generic prompts
 
-FORBIDDEN WORDS (Do NOT use these unless explicitly part of the product name):
-- "India"
-- "Trend", "Trending", "Viral"
-- "Winterwear", "Summerwear"
-- "Best", "Top", "Cheap", "Online"
-
-Types:
-- "specific":
-  - User is clearly looking for ONE focused thing.
-  - Return exactly 1 tight query in `queries`.
-- "discovery":
-  - User is browsing, says things like "ideas", "options", "trending", "what's in", "show me some".
-  - Return exactly 3 short, concrete queries that each describe one product family.
-  - Make them diverse but simple.
-- "pairing":
-  - User wants items that go with another item.
-  - Return exactly 3 short, complementary queries.
-
-Remember:
-- `queries` MUST be short and simple, not long paragraphs.
-- NO "India" suffix.
-- NO "Trending" prefix.
+Remember: `queries` MUST be short and diverse!
 """.strip()
 
     try:
+        # Build user content with gender context
+        user_content = {"query": query}
+        if gender_term:
+            user_content["gender_context"] = gender_term
+        if forced_type:
+            user_content["forced_type"] = forced_type
+        
         response = await asyncio.to_thread(
             client.responses.create,
             model=Config.FAST_MODEL,
             input=[
                 {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": json.dumps({"query": query}),
-                },
+                {"role": "user", "content": json.dumps(user_content)},
             ],
-            max_output_tokens=200,
+            max_output_tokens=250,  # Increase to allow 3 queries
         )
 
         raw_text = (response.output_text or "").strip()
@@ -917,14 +932,9 @@ Remember:
             try:
                 parsed = json.loads(raw_text)
             except Exception as e:
-                logger.error(
-                    "❌ classify_intent JSON parse failed",
-                    raw=raw_text,
-                    error=str(e),
-                )
+                logger.error("❌ classify_intent JSON parse failed", raw=raw_text, error=str(e))
 
         if not parsed:
-            # Safe default
             result = {"search_type": "specific", "queries": [query]}
             await INTENT_CACHE.set(cache_key, result)
             return result
@@ -935,22 +945,30 @@ Remember:
 
         queries = parsed.get("queries", [query])
 
-        # Normalize queries and enforce counts
-        if search_type == "specific":
-            queries = queries[:1]
-        else:
-            # Discovery or pairing: enforce 3 queries
+        # 🆕 ENFORCE 3 queries for discovery/pairing
+        if search_type in ("discovery", "pairing"):
             if len(queries) < 3:
-                base = query
-                expanded = []
-                for q in queries:
-                    if q and q not in expanded:
-                        expanded.append(q)
-                while len(expanded) < 3:
-                    expanded.append(base)
-                queries = expanded[:3]
+                logger.warning(f"⚠️ Only {len(queries)} queries for {search_type}, expanding...")
+                # Expand with variations
+                base = queries[0] if queries else query
+                if search_type == "discovery":
+                    # Generate material/style variations
+                    variations = [
+                        base,
+                        base.replace("Cotton", "Linen").replace("cotton", "linen"),
+                        base.replace("formal", "casual").replace("Formal", "Casual")
+                    ]
+                    queries = list(dict.fromkeys(variations))[:3]  # Dedupe
+                else:  # pairing
+                    # Generate color variations
+                    colors = ["White", "Light blue", "Pastel"]
+                    queries = [f"{color} {base}" for color in colors]
+                
+                logger.info(f"📝 Expanded to: {queries}")
             else:
                 queries = queries[:3]
+        else:
+            queries = queries[:1]
 
         result = {"search_type": search_type, "queries": queries}
         await INTENT_CACHE.set(cache_key, result)
@@ -961,13 +979,12 @@ Remember:
             duration_ms=ms,
             search_type=search_type,
             num_queries=len(queries),
-            parsed=result,
+            queries=queries,
         )
         return result
     except Exception as e:
         ms = int((time.perf_counter() - t0) * 1000)
         logger.error("❌ classify_intent failed", duration_ms=ms, error=str(e))
-        # Safe default
         result = {"search_type": "specific", "queries": [query]}
         await INTENT_CACHE.set(cache_key, result)
         return result
@@ -1100,12 +1117,36 @@ async def _llm_rerank_products(
 
     system_prompt = """
 You are a ranking model for a fashion shopping assistant.
-Reorder the candidate products so that the top items best match the user request.
-- Drop only the products that are clearly irrelevant.
-- If at least `min_results` items are relevant, return at least that many.
-- Preserve the IDs exactly as provided.
-- Respond ONLY with a JSON object:
-  {"ordered_ids": ["id1", "id2", ...]}
+
+CRITICAL DIVERSITY REQUIREMENT:
+- You MUST prioritize brand diversity in the top results
+- In the top 8 results, try to include at least 3-4 different brands
+- Do NOT rank all products from the same brand consecutively
+
+Ranking rules:
+1. Match user request (relevance)
+2. Ensure brand diversity (mix different brands)
+3. Drop only clearly irrelevant items
+4. Return at least `min_results` items if available
+5. Preserve IDs exactly as provided
+
+Output ONLY this JSON:
+{"ordered_ids": ["id1", "id2", ...]}
+
+Example of GOOD diversity (top 8):
+- Rare Rabbit shirt
+- Nonasties shirt  ← Different brand
+- Rare Rabbit trouser
+- Cultstore shirt  ← Different brand
+- Rare Rabbit kurta
+- Fabindia shirt  ← Different brand
+
+Example of BAD diversity (top 8):
+- Rare Rabbit shirt
+- Rare Rabbit shirt  ← Same brand repeatedly!
+- Rare Rabbit trouser
+- Rare Rabbit kurta
+- Rare Rabbit shirt
 """.strip()
 
     llm_t0 = time.perf_counter()
@@ -1139,6 +1180,7 @@ Reorder the candidate products so that the top items best match the user request
                 end = raw_text.rfind("}")
                 if start != -1 and end != -1 and end > start:
                     data = json.loads(raw_text[start : end + 1])
+        
         ordered_ids = data.get("ordered_ids") or data.get("products") or []
         id_map = {str(_product_identity(p)): p for p in candidates}
         ordered: List[Dict[str, Any]] = []
@@ -1159,13 +1201,17 @@ Reorder the candidate products so that the top items best match the user request
                 continue
             ordered.append(product)
 
+        # 🆕 Log brand distribution
+        brand_counts = {}
+        for p in ordered[:8]:
+            brand = p.get("brand", "Unknown")
+            brand_counts[brand] = brand_counts.get(brand, 0) + 1
+        
+        logger.info(f"📊 Top 8 brand distribution: {brand_counts}")
+
         llm_ms = int((time.perf_counter() - llm_t0) * 1000)
-        logger.perf(
-            "rerank_llm",
-            llm_ms,
-            in_count=len(candidates),
-            out_count=len(ordered),
-        )
+        logger.perf("rerank_llm", llm_ms, in_count=len(candidates), out_count=len(ordered))
+        
         return ordered
     except Exception as e:
         logger.warning("LLM rerank failed", error=str(e))
@@ -1244,14 +1290,22 @@ async def t_search_fashion_products(
     user_gender: Optional[str] = None,
     category_filter: Optional[str] = None,
     search_type: str = "auto",
+    budget: Optional[Budget] = None,
 ) -> Dict[str, Any]:
     """
-    - Always treats searches as gender neutral internally.
-    - For discovery / pairing: expands to 3 short fashion-only queries and runs them in PARALLEL.
+    - Filters by user_gender when provided (Menswear -> men, Womenswear -> women).
+    - For discovery / pairing: uses the 3 short fashion-only queries returned by t_classify_intent.
     - Combines products from all queries, dedupes by product id, then reranks (if needed).
     """
-    # Use gender if provided
-    # user_gender = None
+
+    if budget and user_gender:
+        budget.user_gender = user_gender
+    
+    # If gender wasn't provided but we have it from before, use it
+    if budget and not user_gender and budget.user_gender:
+        user_gender = budget.user_gender
+        logger.info(f"♻️ Reusing saved gender: {user_gender}")
+
 
     cache_key = _cache_key("search", query.lower(), search_type)
     cached = await SEARCH_CACHE.get(cache_key)
@@ -1272,8 +1326,10 @@ async def t_search_fashion_products(
         if search_type in ("auto", "discovery", "pairing"):
             forced_type = None if search_type == "auto" else search_type
             intent = await t_classify_intent(query, user_gender, forced_type=forced_type)
-            search_type = intent["search_type"]
-            queries = intent["queries"]
+            search_type = intent.get("search_type", "specific")
+            queries = intent.get("queries", [query])
+            if forced_type:
+                search_type = forced_type
         else:
             search_type = "specific"
             queries = [query]
@@ -1283,7 +1339,12 @@ async def t_search_fashion_products(
             search_type = "discovery"
             # Rely on classifier for queries, do not hardcode "India" ones here.
 
-        logger.debug("📋 Search queries", type=search_type, queries=queries)
+        logger.debug("Search queries", type=search_type, queries=queries)
+
+        if user_gender:
+            logger.info(f"🎯 Final gender for search: {user_gender}")
+        else:
+            logger.warning("⚠️ No gender provided or saved - searching without gender filter")
 
         # Embedding
         embed_t0 = time.perf_counter()
@@ -1294,8 +1355,39 @@ async def t_search_fashion_products(
         # Qdrant search
         from qdrant_client.http import models as rest
 
+        # Map user_gender to catalog gender values
+        gender_filter_value = None
+        if user_gender:
+            gender_map = {
+                "menswear": "men",
+                "womenswear": "women", 
+                "neutral": "unisex",
+            }
+            gender_filter_value = gender_map.get(user_gender.lower())
+
         async def _search_one(q: str, vec: List[float]):
             def _do():
+                # Build filter conditions dynamically
+                must_conditions = []
+                
+                if category_filter:
+                    must_conditions.append(
+                        rest.FieldCondition(
+                            key="category_path",
+                            match=rest.MatchText(text=category_filter),
+                        )
+                    )
+                
+                if gender_filter_value:
+                    must_conditions.append(
+                        rest.FieldCondition(
+                            key="attributes.gender",
+                            match=rest.MatchValue(value=gender_filter_value),
+                        )
+                    )
+                
+                query_filter = rest.Filter(must=must_conditions) if must_conditions else None
+                
                 return Services.qdr.query_points(
                     collection_name=Config.CATALOG_COLLECTION,
                     query=vec,
@@ -1306,14 +1398,7 @@ async def t_search_fashion_products(
                     ),
                     with_payload=True,
                     search_params=rest.SearchParams(hnsw_ef=Config.HNSW_EF),
-                    query_filter=rest.Filter(
-                        must=[
-                            rest.FieldCondition(
-                                key="category_path",
-                                match=rest.MatchText(text=category_filter),
-                            )
-                        ]
-                    ) if category_filter else None,
+                    query_filter=query_filter,
                 )
 
             return await asyncio.to_thread(_do)
@@ -1356,6 +1441,12 @@ async def t_search_fashion_products(
                 score = float(point.score)
                 best_score = max(best_score, score)
 
+                image_url = payload.get('primary_image') or payload.get('image_url')
+                if not image_url:
+                    images = payload.get('images')
+                    if isinstance(images, list) and images:
+                        image_url = images[0]
+
                 card = {
                     'id': pid,
                     'product_id': pid,
@@ -1364,8 +1455,7 @@ async def t_search_fashion_products(
                     'category': payload.get('category_leaf'),
                     'category_leaf': payload.get('category_leaf'),
                     'category_path': payload.get('category_path'),
-                    'image_url': payload.get('primary_image')
-                    or payload.get('image_url'),
+                    'image_url': image_url,
                     'url': payload.get('url'),
                     'price': commerce.get('price'),
                     'price_inr': commerce.get('price_inr'),
@@ -1430,19 +1520,31 @@ async def t_search_fashion_products(
                     requested=needed,
                 )
 
+        ranked_products: List[Dict[str, Any]] = []
+        for idx, product in enumerate(final_products, 1):
+            ranked = dict(product)
+            ranked["rank"] = idx
+            ranked_products.append(ranked)
+        final_products = ranked_products
+
         storage_limit = max(Config.FINAL_RERANK_TOP_K, Config.DISPLAY_PRODUCTS_COUNT)
         stored_products = final_products[:storage_limit]
         display_products = stored_products[: Config.DISPLAY_PRODUCTS_COUNT]
+        logger.debug(
+            "Display products order",
+            titles=[p.get("title") for p in display_products],
+            sources=[p.get("from_query") for p in display_products],
+        )
 
         result_payload = {
             "products": display_products,
-            "all_products": stored_products,
             "total_found": len(final_products),
             "search_type": search_type,
             "queries_used": queries,
             "best_score": best_score,
             "total_candidates": total_candidates,
             "web_topup_count": len(web_products),
+            "_all_products": stored_products,
         }
 
         await SEARCH_CACHE.set(cache_key, result_payload)
@@ -1644,7 +1746,7 @@ TOOLS_SCHEMA = [
         "description": (
             "Smart fashion search backed ONLY by the internal catalog (Qdrant). "
             "Use this for any request that involves buying, showing, or recommending items. "
-            "Provide ONE tight fashion query (material + category + vibe) and the tool will auto-expand discovery/pairing cases into up to 3 short searches, dedupe, rerank (vector + LLM), and guarantee at least 8 strong products with web-search fallback when needed. "
+            "Provide ONE tight fashion query (material + category + vibe) and the tool will auto-expand discovery/pairing cases into short searches, dedupe, rerank (vector + LLM), and guarantee at least 8 strong products with web-search fallback when needed. "
             "Do NOT call this repeatedly in the same reply unless the user clearly asks for a brand-new category or filter. "
             "BAD Query: 'masculine wardrobe staples', 'party wear', 'office outfit'. "
             "GOOD Query: 'White Linen Shirt', 'Navy Blue Chinos', 'Black Leather Boots', 'Beige Cotton Trousers'. "
@@ -1746,6 +1848,14 @@ ASSUMPTIONS:
 - When the user asks for products (e.g. "I want shirts"), IF you don't know the gender yet, ask for it THEN (and use `show_options`).
 - Do NOT search until you have this preference.
 
+CRITICAL GENDER RULE:
+- Once you know the user's gender preference (Menswear/Womenswear/Neutral), you MUST pass it as `user_gender` to EVERY call to search_fashion_products.
+- Example: If user chose "Menswear", then ALL searches must include user_gender="Menswear"
+  - ✅ search_fashion_products(query="Cotton kurta set", user_gender="Menswear", category_filter="ethnic")
+  - ❌ search_fashion_products(query="Cotton kurta set", category_filter="ethnic")  # Missing user_gender!
+- This applies to work wear, pairing, traditional wear, casual wear, EVERYTHING.
+- Only skip user_gender if the user explicitly wants opposite gender items (e.g., "show me women's dresses for my sister").
+
 OVERALL UX VIBE:
 - Replies must be short and product forward.
   - Maximum 1 or 2 short sentences before the product bullets.
@@ -1758,7 +1868,7 @@ OVERALL UX VIBE:
 1) Brand and “What is MUSE”:
 - If the user asks “What is Muse or MUSE or what do you do”:
   - In 1 or 2 sentences:
-    - Say that MUSE is an India based fashion discovery platform curating Indian and global brands.
+    - Say that MUSE is an India based fashion discovery platform curating Indian D2C fashion brands.
     - Say that MuseBot is the chat stylist that plans outfits and surfaces real catalog products.
   - Example:
     - “I am MuseBot, the chat stylist for MUSE, an India first fashion discovery platform. I help you plan outfits and find real pieces you can actually buy 🙂✨”
@@ -1767,7 +1877,7 @@ OVERALL UX VIBE:
 - You only talk about fashion, style, grooming, clothing, footwear, and accessories.
 - If the user asks non fashion things (coding, elephants, matcha, politics, etc):
   - Give ONE playful line, for example:
-    - “I am only licensed to style outfits, not politics, but we can still make your look iconic 🐘✨”
+    - “I am only licensed to style outfits, not politics, but we can still make your look iconic”
   - Then nudge back with a simple fashion question:
     - “What are you dressing for next, work, date, travel, or festive”
 
@@ -1790,6 +1900,7 @@ OVERALL UX VIBE:
 - When the products list is non empty:
   - Treat them as valid matches and speak from that list.
   - Show up to 8 bullets by default (the UI only displays the top 8). For broader discovery or if the user explicitly asks for more, you may reference additional cached products.
+  - **IMPORTANT**: The `products` array already has the best-first ranking. Mention the pieces in that exact order (rank ascending) and do not reshuffle or interleave by vibe.
   - Bullet style must be aesthetic, for example:
     - “A crisp light blue cotton shirt from Rare Rabbit, sharp contrast with navy trousers for office days 🙂”
     - “A relaxed navy shacket from Cultstore, throw on over a tee and chinos for casual dates 😌”
@@ -1814,14 +1925,14 @@ OVERALL UX VIBE:
   - Use the weather only as a short helper line to adjust fabrics and layers.
   - Do not mention Open Meteo or any API by name in your reply.
 
-6) Trends and Korean trousers:
+6) Trends:
 - You will receive a separate system message with cached fashion trend notes for western and ethnic wear.
 - Use this only as light seasoning, not strict truth.
 - For any question like “what is trending” or “what are the latest trends”:
   - First, read the cached trend system message.
   - Give exactly ONE short sentence summarising what is trending using that context.
   - Then, if helpful, call “search_fashion_products” with short discovery queries (for example oversized shirts, Korean trousers, co ord sets).
-- For example, if the user searches for “Korean trousers” or “oversized shirts”:
+- For example, if the user searches items that are trending, like “Korean trousers” or “oversized shirts”:
   - You can say:
     - “Excellent choice, Korean style trousers are very much in trend right now, relaxed straight fits with clean lines look super sharp 👌”
   - Then show catalog products and pairing ideas.
@@ -1837,6 +1948,7 @@ OVERALL UX VIBE:
   - Once known, stick to it for the session unless changed.
   - If the UI has buttons for gender, you can say:
     - “You can tap an option or just tell me”
+- After the user picks Menswear/Womenswear/Neutral, your next clarification should be the occasion / vibe (for example Work, Date, Travel, Festive, Casual). Prefer those options over specific product categories so discovery stays broad.
 - The question about name or gender should be separate from other questions and not spammy.
 - End each message with just one simple next step question.
 
@@ -1853,7 +1965,7 @@ OVERALL UX VIBE:
 - Tone: stylish Indian friend or wingman, not a corporate assistant.
 - Structure:
   1) One or two short sentences of context with 1 to 3 emojis.
-  2) Bullet list of products in the stylist voice.
+  2) Bullet list of products in the stylist voice (max 8). Each bullet must be super tight: “Brand + key adjective + garment + short vibe clause” – aim for 10 words or fewer, e.g. “Rare Rabbit linen shirt, soft pastel lift for Monday meetings 🙂”. Do not repeat “men’s” everywhere, skip long descriptors, and keep it punchy.
   3) One short question to move forward (size, budget, vibe, or occasion).
 - Example of good bullets without long dashes:
   - “A soft off white mandarin collar kurta from Fabindia, perfect for office traditional day without feeling overdressed 🎉”
@@ -1931,13 +2043,21 @@ async def _run_single_tool_call(tool_call, budget: Budget) -> Dict[str, Any]:
     t0 = time.perf_counter()
     try:
         logger.info("🔧 Executing tool", tool=name, args=args)
+        
+        # 🆕 Inject budget for search_fashion_products
+        if name == "search_fashion_products":
+            args["budget"] = budget
+        
         result = await fn(**args)
 
         # Capture last product search for frontend
         if name == "search_fashion_products" and isinstance(result, dict):
-            budget.last_search_result = result
-            source_products = result.get("all_products") or result.get("products") or []
-            budget.record_products(source_products)
+            safe_result = dict(result)
+            all_products = safe_result.pop("_all_products", None)
+            display_products = safe_result.get("products") or []
+            budget.last_search_result = safe_result
+            budget.record_products(display_products, all_products)
+            result = safe_result
 
         # Capture options from show_options
         if name == "show_options" and isinstance(result, dict):
@@ -1968,7 +2088,7 @@ async def _run_single_tool_call(tool_call, budget: Budget) -> Dict[str, Any]:
         ms = int((time.perf_counter() - t0) * 1000)
         budget.consume(name or "unknown", ms, success=False)
         logger.error("❌ Tool execution failed", tool=name, duration_ms=ms, error=str(e))
-        logger.error(traceback.format_exc())
+        logger.error(traceback.print_exc())
         return {
             "type": "function_call_output",
             "call_id": call_id,
@@ -2070,14 +2190,15 @@ async def run_conversation(
             op_name = "llm_initial" if iteration == 0 else f"llm_iteration_{iteration}"
             logger.perf(op_name, llm_ms, model=Config.MAIN_MODEL)
 
+            # Separate blocks for logging and decision making
             reasoning_blocks = [
-                block.to_dict() for block in response.output if block.type == "reasoning"
+                block for block in response.output if block.type == "reasoning"
             ]
             function_calls = [
                 block for block in response.output if block.type == "function_call"
             ]
             message_blocks = [
-                block.to_dict() for block in response.output if block.type == "message"
+                block for block in response.output if block.type == "message"
             ]
             final_text = (response.output_text or "").strip()
 
@@ -2089,20 +2210,23 @@ async def run_conversation(
                 num_messages=len(message_blocks),
             )
 
-            if reasoning_blocks:
-                conversation.extend(reasoning_blocks)
+            # Add all assistant output blocks IN ORDER to maintain reasoning->function_call pairing
+            # OpenAI requires: reasoning MUST be immediately followed by function_call or message
+            for block in response.output:
+                if block.type in ("reasoning", "message"):
+                    conversation.append(block.to_dict())
+                elif block.type == "function_call":
+                    # Add function_call and then execute it
+                    conversation.append(block.to_dict())
 
+            # Execute function calls and add their outputs
             if function_calls:
                 logger.info("🔧 Executing %d tools" % len(function_calls))
                 tool_outputs = await asyncio.gather(
                     *[_run_single_tool_call(fc, budget) for fc in function_calls]
                 )
-                for fc, out_block in zip(function_calls, tool_outputs):
-                    conversation.append(fc.to_dict())
+                for out_block in tool_outputs:
                     conversation.append(out_block)
-
-            if message_blocks:
-                conversation.extend(message_blocks)
 
             # If tools were used, loop again to let the model read them
             if function_calls:
@@ -2361,7 +2485,7 @@ async def gradio_handler(
     logger.info("🌐 Gradio request", user_id=user_id, thread_id=thread_id)
 
     full_response = ""
-    async for chunk in run_conversation_stream(user_id, message, thread_id):
+    async for chunk in run_conversation_stream(user_id, message, thread_id, history=history):
         if full_response:
             yield chunk
         else:

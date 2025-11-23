@@ -1,0 +1,54 @@
+# MANUAL FIX INSTRUCTIONS FOR responses_agent.py
+# =================================================
+
+## Issue 1: Qdrant Index Error (Gender Filter)
+## Issue 2: Query Diversity (Discovery Mode)
+
+### FIX 1: Change Gender Filter (Around Line 1344)
+# ---------------------------------------------
+# Find this code block:
+                if gender_filter_value:
+                    must_conditions.append(
+                        rest.FieldCondition(
+                            key="attributes.gender",
+                            match=rest.MatchValue(value=gender_filter_value),  # <-- CHANGE THIS LINE
+                        )
+                    )
+
+# Change the line to:
+                            match=rest.MatchText(text=gender_filter_value),  # <-- NEW VERSION
+
+# This fixes the Qdrant index error by using MatchText instead of MatchValue
+
+
+### FIX 2: Add Discovery Mode for Broad Occasions (Around Line 1865)
+# -----------------------------------------------------------------
+# Find this section in 5) Tool usage:
+
+5) Tool usage:
+- For any outfit, clothing, shoes, or shopping question:
+  - Make ONE call to "search_fashion_products" early...
+- For pairing or discovery questions (e.g., "what goes with navy trousers"):  # <-- ADD NEW SECTION BEFORE THIS
+  - Set `search_type="discovery"` (or leave it blank/auto)...
+
+# ADD these lines BEFORE "For pairing or discovery questions":
+
+- **For BROAD occasion requests** (user says just "Work", "Casual", "Date", "Festive"):
+  - Use `search_type="discovery"` with a simple query like "Office wear" or "Casual outfits".
+  - This generates 3 diverse product queries automatically. Do NOT pick one specific item.
+
+# Also CHANGE this line:
+- When building the search query string:
+  - Keep it gender neutral (no "men/women"), "unisex" is OK.  # <-- REMOVE THIS LINE
+
+# And REPLACE it with:
+  - Gender is automatically added based on user preference, just describe the product/category.
+
+
+### SUMMARY OF CHANGES:
+1. Line ~1344: MatchValue -> MatchText  
+2. Lines ~1866-1871: Add discovery mode instruction and update gender instruction
+
+These two small changes will:
+- Fix the Qdrant index error (Issue 1)
+- Make the bot use diverse queries for broad requests like "Work" (Issue 2)
