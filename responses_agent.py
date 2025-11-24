@@ -830,6 +830,271 @@ async def t_profile_write(
 # =============================================================================
 # Intent classification (fashion-only, no budget terms inside queries)
 # =============================================================================
+
+# ---------- HELPER: build system prompt with hard diversity rules ----------
+INTENT_SYSTEM_PROMPT = """
+You are a fashion search intent classifier for an India-first stylist bot.
+
+You receive a short JSON like:
+{"query": "...", "gender_context": "for women" | "for men" | "", "forced_type": "specific" | "discovery" | "pairing" | null}
+
+You must output ONLY a JSON object (no prose, no markdown, no backticks) in this format:
+
+{
+  "search_type": "specific" | "discovery" | "pairing",
+  "queries": ["string", "string", "string"]
+}
+
+Rules for search_type:
+- "specific": User clearly wants one concrete item (e.g. "red linen dress", "white shirt").
+- "discovery": User wants to browse looks, outfits, or options for a vibe/occasion (e.g. "date", "office wear", "festive").
+- "pairing": User wants items that go WITH something they already have (e.g. "what to wear with navy trousers").
+
+If the input has "forced_type", you MUST set "search_type" to that exact value.
+
+Rules for "queries":
+- Always output exactly 3 strings.
+- Each query max 6 words.
+- They must be realistic shopping queries: "[fabric/fit/colour] + [item] + [short modifier]".
+  Examples of shape only (do not copy words):
+    "satin wrap midi dress"
+    "linen wide leg trousers"
+    "cotton kurta with palazzo"
+
+Light diversity:
+- For general or discovery queries, try to vary:
+  - garment category (dress vs top+bottom vs jumpsuit/co-ord),
+  - silhouette (mini/midi/maxi, fitted vs relaxed),
+  - or vibe (casual, polished, festive).
+- Do NOT output three near-identical phrases.
+
+Gender context:
+- If "gender_context" == "for women", use womenswear silhouettes.
+- If "gender_context" == "for men", use menswear silhouettes.
+- If empty or missing, stay neutral.
+
+INDIA-FIRST LOGIC (VERY IMPORTANT):
+
+1) DATE OUTFITS (MODERN INDIAN WOMEN)
+- If the query mentions "date", "date night", "coffee date", "first date" and does NOT contain words like
+  "ethnic", "traditional", "saree", "lehenga", "kurta":
+  - Treat it as a MODERN DATE look.
+  - For WOMEN:
+    - At least 2 of the 3 queries MUST be WESTERN date pieces:
+      - dresses (slip, wrap, fit and flare, bodycon, midi/mini),
+      - jumpsuits / playsuits,
+      - co-ord sets,
+      - nice tops with skirts or trousers.
+    - The 3rd can also be western. Only use ethnic (e.g. kurta set) if the user explicitly mentions ethnic/traditional.
+  - DO NOT output saree, lehenga or heavy kurta sets for a normal "date" or "date night" query unless the text clearly asks for ethnic.
+
+Examples of good womenswear date queries (shapes only):
+- "black slip mini dress"
+- "floral midi wrap dress"
+- "satin co ord set"
+- "chiffon blouse with skirt"
+
+2) FESTIVE / WEDDING / ETHNIC QUERIES (INDIAN ETHNIC ONLY)
+- If the query mentions any of:
+  "festive", "wedding", "sangeet", "mehendi", "reception",
+  "diwali", "navratri", "ethnic day", "traditional day", "puja", "eid":
+  - Treat it as an ETHNIC occasion.
+  - ALL 3 queries MUST be clearly Indian ethnic outfits, no western gowns or jumpsuits unless the user explicitly says "western festive" or similar.
+
+  For WOMEN, prefer:
+    - saree with blouse,
+    - lehenga choli set,
+    - anarkali suit,
+    - sharara set,
+    - kurta with palazzo or straight pants,
+    - lightweight festive co-ord sets in Indian fabrics/prints.
+
+  For MEN, prefer:
+    - kurta pajama,
+    - kurta with churidar or straight pants,
+    - sherwani,
+    - bandhgala,
+    - Nehru jacket over kurta.
+
+  You MUST NOT output:
+    - western jumpsuits,
+    - cocktail gowns,
+    - generic "party dress" style queries
+  for these festive / ethnic keywords.
+
+3) NEUTRAL / OTHER OCCASIONS
+- For office, casual, travel, party (without explicit "festive"/"ethnic" words):
+  - Mix appropriate categories for that vibe (shirts, trousers, dresses, co-ords, jeans, etc.).
+  - Still keep Indian context in mind (fabrics like cotton, linen, light layers for heat, etc.).
+
+SPECIAL CASE: SPECIFIC ITEM QUERIES
+- If the user clearly names one item type ("summer dress", "linen shirt"):
+  - Keep all 3 queries in that item family, but vary colour/fabric/length.
+
+Examples of output (shape only):
+
+Input:
+{"query": "date night outfit", "gender_context": "for women"}
+Output:
+{"search_type": "discovery",
+ "queries": [
+   "black satin slip dress",
+   "floral wrap midi dress",
+   "chiffon blouse with skirt"
+ ]}
+
+Input:
+{"query": "festive wear for cousin wedding", "gender_context": "for women"}
+Output:
+{"search_type": "discovery",
+ "queries": [
+   "embroidered lehenga choli set",
+   "silk saree with blouse",
+   "anarkali suit with dupatta"
+ ]}
+
+REMINDERS:
+- Obey "forced_type" if present.
+- Return ONLY valid JSON.
+- No extra text, no markdown, no comments.
+""".strip()
+
+
+
+# ---------- HELPER: extract raw text from Responses API result ----------
+def _extract_text_from_response(response: Any) -> str:
+    """
+    Tries to robustly extract the model's text output from a Responses API object.
+    Adjust this if your SDK's structure differs slightly.
+    """
+    # 1. New Responses-style: response.output -> list of blocks
+    output = getattr(response, "output", None)
+    if output:
+        chunks: List[str] = []
+        try:
+            for block in output:
+                btype = getattr(block, "type", None)
+
+                # Typical reasoning output: type == "message", with .content list
+                if btype == "message":
+                    contents = getattr(block, "content", []) or []
+                    for c in contents:
+                        ctype = getattr(c, "type", None)
+
+                        # For reasoning models: content.type == "output_text" with nested .output_text.text
+                        if ctype == "output_text":
+                            ot = getattr(c, "output_text", None)
+                            if ot is not None:
+                                txt = getattr(ot, "text", None)
+                                if isinstance(txt, str):
+                                    chunks.append(txt)
+                        # Fallback: plain text
+                        elif ctype == "text":
+                            txt = getattr(c, "text", None)
+                            if isinstance(txt, str):
+                                chunks.append(txt)
+
+                # Some variants may have top-level output_text blocks
+                elif btype == "output_text":
+                    txt = getattr(block, "text", None)
+                    if isinstance(txt, str):
+                        chunks.append(txt)
+
+            if chunks:
+                raw = "".join(chunks).strip()
+                if raw:
+                    return raw
+        except Exception as e:
+            logger.warning("Failed to parse response.output structure", error=str(e))
+
+    # 2. Legacy or convenience attribute: response.output_text
+    ot = getattr(response, "output_text", None)
+    if isinstance(ot, str) and ot.strip():
+        return ot.strip()
+
+    # 3. Nothing we understand
+    return ""
+
+
+# ---------- HELPER: clean JSON text & parse ----------
+def _clean_json_text(raw_text: str) -> str:
+    """
+    Strip markdown code fences and whitespace around the JSON.
+    """
+    raw_text = raw_text.strip()
+
+    if "```" in raw_text:
+        # Remove ```json ... ``` or ``` ... ```
+        raw_text = re.sub(r"```json\s*", "", raw_text, flags=re.IGNORECASE)
+        raw_text = re.sub(r"```", "", raw_text)
+
+    return raw_text.strip()
+
+
+def _normalize_and_diversify_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    - Ensure search_type is one of the expected values (fallback to 'discovery').
+    - Clean & dedupe queries, keep at most 3.
+    - Log if diversity looks poor (but do not call the LLM again in this function).
+    """
+    valid_types = {"specific", "discovery", "pairing"}
+    st = str(result.get("search_type", "")).lower()
+    if st not in valid_types:
+        logger.warning("Invalid or missing search_type from model; defaulting to 'discovery'", search_type=st)
+        st = "discovery"
+
+    raw_queries = result.get("queries", [])
+    if not isinstance(raw_queries, list):
+        logger.warning("Model returned non-list 'queries'; coercing to []", queries=raw_queries)
+        raw_queries = []
+
+    cleaned: List[str] = []
+    seen_lower: set = set()
+
+    for q in raw_queries:
+        if not isinstance(q, str):
+            continue
+        q_clean = q.strip()
+        if not q_clean:
+            continue
+        key = q_clean.lower()
+        if key in seen_lower:
+            continue
+        seen_lower.add(key)
+        cleaned.append(q_clean)
+
+    if not cleaned:
+        logger.warning("Model returned empty/invalid queries; setting fallback empty list.")
+        cleaned = []
+
+    # Truncate / enforce at most 3
+    if len(cleaned) > 3:
+        logger.debug("Truncating queries to 3 items", original_len=len(cleaned))
+        cleaned = cleaned[:3]
+
+    # Simple lexical overlap check just for logging (not strict enforcement)
+    def overlap_score(a: str, b: str) -> int:
+        toks_a = {t for t in re.findall(r"[a-zA-Z]+", a.lower()) if len(t) > 3}
+        toks_b = {t for t in re.findall(r"[a-zA-Z]+", b.lower()) if len(t) > 3}
+        return len(toks_a & toks_b)
+
+    if len(cleaned) >= 2:
+        max_overlap = 0
+        for i in range(len(cleaned)):
+            for j in range(i + 1, len(cleaned)):
+                max_overlap = max(max_overlap, overlap_score(cleaned[i], cleaned[j]))
+        if max_overlap > 2:
+            logger.warning(
+                "Queries appear lexically similar (possible low diversity from model).",
+                queries=cleaned,
+                max_overlap=max_overlap,
+            )
+
+    result["search_type"] = st
+    result["queries"] = cleaned
+    return result
+
+
 async def t_classify_intent(
     query: str,
     user_gender: Optional[str] = None,
@@ -849,222 +1114,88 @@ async def t_classify_intent(
     logger.info("🧠 classify_intent", query=query[:80], forced_type=forced_type)
 
     # Map user_gender to simple terms for queries
-    gender_term = None
+    gender_term = ""
     if user_gender:
         gender_map = {
             "menswear": "for men",
+            "men": "for men",
+            "male": "for men",
             "womenswear": "for women",
+            "women": "for women",
+            "female": "for women",
             "neutral": "",
+            "unisex": "",
         }
         gender_term = gender_map.get(user_gender.lower(), "")
 
-    # CRITICAL: Make the prompt EXTREMELY explicit about JSON format
-    system_prompt = """You are a fashion search intent classifier.
+    user_content_dict: Dict[str, Any] = {"query": query}
+    if gender_term:
+        user_content_dict["gender_context"] = gender_term
+    if forced_type:
+        user_content_dict["forced_type"] = forced_type
 
-YOUR ONLY JOB: Output a valid JSON object. Nothing else. No explanations. No markdown. Just pure JSON.
+    user_content = json.dumps(user_content_dict)
 
-REQUIRED OUTPUT FORMAT (copy this structure exactly):
-{
-  "search_type": "specific",
-  "queries": ["query1", "query2", "query3"]
-}
+    models_to_try = [Config.FAST_MODEL]
+    if Config.MAIN_MODEL not in models_to_try:
+        models_to_try.append(Config.MAIN_MODEL)
 
-RULES FOR search_type:
-- "specific": User wants one exact item → output 1 query
-- "discovery": User wants to explore options → output 3 DIFFERENT queries
-- "pairing": User wants matching items → output 3 DIFFERENT complementary queries
+    for mdl in models_to_try:
+        # logger.info("Calling model", model=mdl)
 
-RULES FOR queries:
-- Keep SHORT: "Material Color Item" format
-- Examples: "Cotton Shorts", "Navy Trousers", "Floral Dress", "White Shirt"
-- For discovery: 3 variations (different materials/colors/styles)
-  Example: ["Cotton formal shirts", "Linen casual shirts", "Printed office shirts"]
-- For pairing: 3 complementary items (different but matching)
-  Example: ["White cotton shirts", "Light blue shirts", "Beige linen shirts"]
-- NO price words, NO location, NO empty strings
-- ALWAYS return 3 queries for discovery/pairing, 1 for specific
-
-CRITICAL: Your response must be ONLY the JSON object. Start with { and end with }. Nothing before or after.
-
-EXAMPLES:
-
-Input: {"query": "blue shirt"}
-Output: {"search_type": "specific", "queries": ["Blue shirt"]}
-
-Input: {"query": "shirts for office"}
-Output: {"search_type": "discovery", "queries": ["Cotton formal shirts", "Linen casual shirts", "Printed office shirts"]}
-
-Input: {"query": "what goes with navy trousers"}
-Output: {"search_type": "pairing", "queries": ["White cotton shirts", "Light blue formal shirts", "Beige casual shirts"]}
-
-Remember: ONLY output the JSON object. No text before or after.""".strip()
-
-    try:
-        # Build user content
-        user_content_dict = {"query": query}
-        if gender_term:
-            user_content_dict["gender_context"] = gender_term
-        if forced_type:
-            user_content_dict["forced_type"] = forced_type
-            user_content_dict["note"] = f"Force search_type to be '{forced_type}'"
-        
-        user_content = json.dumps(user_content_dict)
-
-        # Call Responses API (NO response_format parameter)
-        response = await asyncio.to_thread(
-            client.responses.create,
-            model=Config.FAST_MODEL,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            max_output_tokens=500,  # Increased for safety
-        )
-
-        raw_text = (response.output_text or "").strip()
-        
-        if not raw_text:
-            logger.warning("⚠️ Empty response from LLM")
-            raise ValueError("Empty response from LLM")
-        
-        logger.debug("🔍 classify_intent RAW OUTPUT", raw_text=raw_text[:300])
-
-        # Aggressive JSON extraction
-        parsed = None
-        
-        # Method 1: Try direct parse
         try:
-            parsed = json.loads(raw_text)
-        except json.JSONDecodeError:
-            pass
-        
-        # Method 2: Remove markdown if present
-        if not parsed:
-            clean_text = raw_text
-            if "```json" in clean_text:
-                clean_text = clean_text.split("```json")[1].split("```")[0].strip()
-            elif "```" in clean_text:
-                clean_text = clean_text.split("```")[1].split("```")[0].strip()
+            # Use asyncio.to_thread to avoid blocking
+            response = await asyncio.to_thread(
+                client.responses.create,
+                model=mdl,
+                input=[
+                    {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                reasoning={"effort": "low"},
+                max_output_tokens=1500,
+            )
+
+            logger.debug("Raw response object", response=str(response)[:500])
+
+            raw_text = _extract_text_from_response(response)
+            raw_text = _clean_json_text(raw_text)
+
+            logger.debug("Extracted raw text", raw_text=raw_text[:500])
+
+            if not raw_text:
+                logger.warning("Empty response text from LLM", model=mdl)
+                continue
+
+            try:
+                result_json = json.loads(raw_text)
+            except json.JSONDecodeError as e:
+                logger.error("JSON parsing failed", error=str(e), raw_text=raw_text)
+                continue # Try next model if JSON is invalid
+
+            normalized = _normalize_and_diversify_result(result_json)
             
-            try:
-                parsed = json.loads(clean_text)
-            except json.JSONDecodeError:
-                pass
-        
-        # Method 3: Find JSON object boundaries
-        if not parsed:
-            try:
-                start_idx = raw_text.find("{")
-                end_idx = raw_text.rfind("}")
-                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                    json_str = raw_text[start_idx : end_idx + 1]
-                    parsed = json.loads(json_str)
-            except json.JSONDecodeError:
-                pass
-        
-        # If all parsing failed, log and use fallback
-        if not parsed:
-            logger.error("❌ All JSON parsing methods failed", raw=raw_text[:200])
-            raise ValueError("Could not parse JSON from response")
+            # Cache and return
+            await INTENT_CACHE.set(cache_key, normalized)
+            
+            ms = int((time.perf_counter() - t0) * 1000)
+            logger.success(
+                "✅ classify_intent",
+                duration_ms=ms,
+                result=normalized
+            )
+            return normalized
 
-        # Extract and validate fields
-        search_type = parsed.get("search_type", "discovery")
-        
-        # Override with forced_type if provided
-        if forced_type in ("specific", "discovery", "pairing"):
-            search_type = forced_type
-        
-        # Validate search_type
-        if search_type not in ("specific", "discovery", "pairing"):
-            logger.warning(f"⚠️ Invalid search_type '{search_type}', defaulting to discovery")
-            search_type = "discovery"
-        
-        queries = parsed.get("queries", [])
-        
-        # Validate queries is a list
-        if not isinstance(queries, list):
-            queries = [str(queries)] if queries else [query]
-        
-        # Clean empty/invalid queries
-        queries = [
-            q.strip() 
-            for q in queries 
-            if q and isinstance(q, str) and q.strip()
-        ]
-        
-        if not queries:
-            logger.warning("⚠️ No valid queries after cleaning, using original")
-            queries = [query]
+        except Exception as e:
+            logger.error("API call failed", model=mdl, error=str(e))
+            # traceback.print_exc() # Use logger instead
 
-        # Enforce query count rules
-        if search_type in ("discovery", "pairing"):
-            if len(queries) < 3:
-                logger.warning(f"⚠️ Only {len(queries)} queries for {search_type}, expanding...")
-                base = queries[0] if queries else query
-                expanded = list(queries)
-                
-                if search_type == "discovery":
-                    # Material/style variations
-                    variations = [
-                        f"Cotton {base}",
-                        f"Linen {base}",
-                        f"Printed {base}",
-                        f"Solid {base}",
-                        f"Silk {base}",
-                    ]
-                else:  # pairing
-                    # Color variations
-                    variations = [
-                        f"White {base}",
-                        f"Black {base}",
-                        f"Navy {base}",
-                        f"Beige {base}",
-                        f"Light blue {base}",
-                    ]
-                
-                for var in variations:
-                    if len(expanded) >= 3:
-                        break
-                    if var not in expanded:
-                        expanded.append(var)
-                
-                queries = expanded[:3]
-                logger.info(f"📝 Expanded to {len(queries)} queries: {queries}")
-            else:
-                queries = queries[:3]
-        else:  # specific
-            queries = queries[:1]
-
-        result = {"search_type": search_type, "queries": queries}
-        await INTENT_CACHE.set(cache_key, result)
-
-        ms = int((time.perf_counter() - t0) * 1000)
-        logger.success(
-            "✅ classify_intent",
-            duration_ms=ms,
-            search_type=search_type,
-            num_queries=len(queries),
-            queries=queries,
-        )
-        return result
-        
-    except Exception as e:
-        ms = int((time.perf_counter() - t0) * 1000)
-        logger.error("❌ classify_intent failed", duration_ms=ms, error=str(e))
-        logger.error(traceback.format_exc())
-        
-        # Smart fallback based on forced_type or query analysis
-        s_type = forced_type if forced_type else "discovery"
-        
-        if s_type == "specific":
-            q_list = [query]
-        elif s_type == "discovery":
-            q_list = [query, f"Printed {query}", f"Solid {query}"]
-        else:  # pairing
-            q_list = [f"White {query}", f"Navy {query}", f"Beige {query}"]
-        
-        result = {"search_type": s_type, "queries": q_list}
-        return result
+    # Fallback if all models fail
+    logger.error("❌ classify_intent failed after trying all models")
+    return {
+        "search_type": forced_type or "discovery",
+        "queries": [query] # Minimal fallback
+    }
 
 # =============================================================================
 # Catalog search helpers
@@ -1367,6 +1498,7 @@ async def t_search_fashion_products(
     category_filter: Optional[str] = None,
     search_type: str = "auto",
     budget: Optional[Budget] = None,
+    user_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     - Filters by user_gender when provided (Menswear -> men, Womenswear -> women).
@@ -1382,6 +1514,29 @@ async def t_search_fashion_products(
         user_gender = budget.user_gender
         logger.info(f"♻️ Reusing saved gender: {user_gender}")
 
+
+    # Enforce that the base query comes from the user's latest message if provided
+    if user_message and user_message != query:
+        logger.debug("🔄 Overriding model query with user_message", model_query=query, user_message=user_message)
+        query = user_message
+
+    # Build a more contextual base query when the user picked a vibe chip
+    gender_phrase = None
+    if user_gender:
+        gmap = {"menswear": "for men", "womenswear": "for women", "neutral": "unisex"}
+        gender_phrase = gmap.get(user_gender.lower())
+
+    ql = query.strip().lower()
+    vibe_chips = {"casual", "work", "date", "travel", "festive"}
+    if ql in vibe_chips:
+        base = f"{query.strip()} outfits"
+        if gender_phrase:
+            base = f"{base} {gender_phrase}"
+        query = base.strip()
+        ql = query.lower()
+    elif gender_phrase and gender_phrase not in ql:
+        query = f"{query.strip()} {gender_phrase}".strip()
+        ql = query.lower()
 
     cache_key = _cache_key("search", query.lower(), search_type)
     cached = await SEARCH_CACHE.get(cache_key)
@@ -1823,6 +1978,7 @@ TOOLS_SCHEMA = [
             "Smart fashion search backed ONLY by the internal catalog (Qdrant). "
             "Use this for any request that involves buying, showing, or recommending items. "
             "Provide ONE tight fashion query (material + category + vibe) and the tool will auto-expand discovery/pairing cases into short searches, dedupe, rerank (vector + LLM), and guarantee at least 8 strong products with web-search fallback when needed. "
+            "Pass the user's latest message verbatim in user_message; do not rewrite it. "
             "Do NOT call this repeatedly in the same reply unless the user clearly asks for a brand-new category or filter. "
             "BAD Query: 'masculine wardrobe staples', 'party wear', 'office outfit'. "
             "GOOD Query: 'White Linen Shirt', 'Navy Blue Chinos', 'Black Leather Boots', 'Beige Cotton Trousers'. "
@@ -1832,6 +1988,10 @@ TOOLS_SCHEMA = [
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
+                "user_message": {
+                    "type": "string",
+                    "description": "The user's latest message verbatim. Use this as the base query; do not rewrite.",
+                },
                 "user_gender": {"type": "string"},
                 "category_filter": {
                     "type": "string",
