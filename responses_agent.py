@@ -14,7 +14,7 @@ import time
 import hashlib
 import traceback
 import re
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from typing import Any, Dict, List, Optional, AsyncGenerator, Set
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -129,7 +129,11 @@ class Config:
     MIN_PRODUCTS_TARGET = int(os.getenv("MIN_PRODUCTS_TARGET", "8"))
     NUMERIC_RERANK_POOL = int(os.getenv("NUMERIC_RERANK_POOL", "30"))
     LLM_RERANK_INPUT_LIMIT = int(os.getenv("LLM_RERANK_INPUT_LIMIT", "20"))
+    BRAND_CAP_PER_WINDOW = int(os.getenv("BRAND_CAP_PER_WINDOW", "3"))
+    BRAND_CAP_WINDOW = int(os.getenv("BRAND_CAP_WINDOW", "32"))
     WEB_TOPUP_MIN_COUNT = int(os.getenv("WEB_TOPUP_MIN_COUNT", "2"))
+    USE_LLM_RERANK = os.getenv("USE_LLM_RERANK", "0") == "1"
+    MAX_PER_BRAND_DISPLAY = int(os.getenv("MAX_PER_BRAND_DISPLAY", "4"))
 
     SEARCH_CACHE_TTL_HOURS = 24
     INTENT_CACHE_TTL_SECONDS = 1800
@@ -1245,6 +1249,117 @@ def _dedupe_products(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return deduped
 
 
+def _brand_key(product: Dict[str, Any]) -> str:
+    brand = (product.get("brand") or "Unknown").strip().lower()
+    return brand or "unknown"
+
+
+def _brand_histogram(products: List[Dict[str, Any]], limit: int = 50) -> Dict[str, int]:
+    hist = defaultdict(int)
+    for p in products[:limit]:
+        hist[_brand_key(p)] += 1
+    return dict(hist)
+
+
+def _brand_cap(products: List[Dict[str, Any]], max_per_brand: int) -> List[Dict[str, Any]]:
+    if max_per_brand <= 0 or len(products) <= 1:
+        return products
+    seen = defaultdict(int)
+    capped: List[Dict[str, Any]] = []
+    for p in products:
+        b = _brand_key(p)
+        if seen[b] >= max_per_brand:
+            continue
+        seen[b] += 1
+        capped.append(p)
+    return capped
+
+
+def _is_image_ok(url: Optional[str], timeout: float = 2.0) -> bool:
+    if not url:
+        return False
+    try:
+        resp = requests.head(url, timeout=timeout, allow_redirects=True)
+        if 200 <= resp.status_code < 400:
+            return True
+        # Some CDNs may block HEAD; fall back to GET
+        resp = requests.get(url, timeout=timeout, allow_redirects=True, stream=True)
+        return 200 <= resp.status_code < 400
+    except Exception:
+        return False
+
+
+async def _pick_displayable_products(
+    products: List[Dict[str, Any]], desired: int
+) -> List[Dict[str, Any]]:
+    """Return up to `desired` products preferring those with valid image URLs.
+    Falls back to original ordering if not enough valid images are found."""
+    if desired <= 0 or not products:
+        return []
+
+    max_checks = min(len(products), desired + 4)
+    subset = products[:max_checks]
+    sem = asyncio.Semaphore(8)
+
+    async def _probe(product: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+        url = product.get("image_url")
+        async with sem:
+            ok = await asyncio.to_thread(_is_image_ok, url)
+        return product, ok
+
+    results = await asyncio.gather(*[_probe(p) for p in subset])
+
+    chosen: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for product, ok in results:
+        if ok and len(chosen) < desired:
+            chosen.append(product)
+        else:
+            skipped.append(product)
+
+    if len(chosen) < desired:
+        remaining = desired - len(chosen)
+        chosen.extend(skipped[:remaining])
+        if remaining:
+            logger.warning(
+                "Insufficient valid images, filled from skipped",
+                needed=desired,
+                with_images=len(chosen) - remaining,
+            )
+    return chosen
+
+
+def _rebalance_brand_pool(
+    products: List[Dict[str, Any]],
+    cap_per_brand: int,
+    window: int,
+) -> List[Dict[str, Any]]:
+    """
+    Soft-cap how many times a single brand can dominate the top of the pool.
+    Keeps order otherwise, pushing overflow to the tail so rerankers still see variety.
+    """
+    if len(products) <= 1 or cap_per_brand <= 0 or window <= 0:
+        return products
+
+    capped: List[Dict[str, Any]] = []
+    overflow: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = defaultdict(int)
+
+    for product in products:
+        brand = _brand_key(product)
+        if len(capped) < window and counts[brand] >= cap_per_brand:
+            overflow.append(product)
+            continue
+
+        if len(capped) < window:
+            counts[brand] += 1
+            capped.append(product)
+        else:
+            overflow.append(product)
+
+    return capped + overflow
+
+
 async def _numeric_rerank_products(user_query: str, products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if len(products) <= 1:
         return products
@@ -1254,7 +1369,7 @@ async def _numeric_rerank_products(user_query: str, products: List[Dict[str, Any
     remainder = products[pool_limit:]
 
     texts = [
-        f"{p.get('title') or ''} {p.get('brand') or ''} {p.get('category') or ''}".strip()
+        f"{p.get('title') or ''} {p.get('category') or p.get('category_leaf') or ''}".strip()
         for p in pool
     ]
     rerank_t0 = time.perf_counter()
@@ -1600,15 +1715,29 @@ async def t_search_fashion_products(
             def _do():
                 # Build filter conditions dynamically
                 must_conditions = []
-                
-                if category_filter:
-                    must_conditions.append(
+                should_conditions = []
+
+                cat = category_filter.strip().lower() if category_filter else None
+                if cat:
+                    should_conditions.append(
                         rest.FieldCondition(
                             key="category_path",
-                            match=rest.MatchText(text=category_filter),
+                            match=rest.MatchText(text=cat),
                         )
                     )
-                
+                    should_conditions.append(
+                        rest.FieldCondition(
+                            key="category_path",
+                            match=rest.MatchAny(any=[cat]),
+                        )
+                    )
+                    should_conditions.append(
+                        rest.FieldCondition(
+                            key="category_leaf",
+                            match=rest.MatchText(text=cat),
+                        )
+                    )
+
                 if gender_filter_value:
                     must_conditions.append(
                         rest.FieldCondition(
@@ -1617,7 +1746,21 @@ async def t_search_fashion_products(
                         )
                     )
                 
-                query_filter = rest.Filter(must=must_conditions) if must_conditions else None
+                query_filter = None
+                if must_conditions or should_conditions:
+                    query_filter = rest.Filter(
+                        must=must_conditions or None,
+                        should=should_conditions or None,
+                    )
+
+                if query_filter:
+                    logger.debug(
+                        "Applying qdrant filter",
+                        category_filter=cat,
+                        gender_filter=gender_filter_value,
+                        must=len(must_conditions),
+                        should=len(should_conditions),
+                    )
                 
                 return Services.qdr.query_points(
                     collection_name=Config.CATALOG_COLLECTION,
@@ -1699,10 +1842,25 @@ async def t_search_fashion_products(
 
         interleaved = _interleave_results(results_lists)
         candidates = _dedupe_products(interleaved)
-        total_candidates = len(candidates)
-
         if len(queries) == 1:
             candidates.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+
+        total_candidates = len(candidates)
+
+        if candidates:
+            logger.debug(
+                "Brand mix pre-balance",
+                top_counts=_brand_histogram(candidates, 50),
+            )
+            candidates = _rebalance_brand_pool(
+                candidates,
+                Config.BRAND_CAP_PER_WINDOW,
+                Config.BRAND_CAP_WINDOW,
+            )
+            logger.debug(
+                "Brand mix post-balance",
+                top_counts=_brand_histogram(candidates, 50),
+            )
 
         logger.debug(
             'Aggregated products',
@@ -1714,14 +1872,15 @@ async def t_search_fashion_products(
         if base_products:
             base_products = await _numeric_rerank_products(query, base_products)
             base_products = _dedupe_products(base_products)
+            base_products = _brand_cap(base_products, Config.MAX_PER_BRAND_DISPLAY)
 
         final_products = base_products
-        if final_products:
+        if final_products and Config.USE_LLM_RERANK:
             llm_ranked = await _llm_rerank_products(
                 query, final_products, Config.MIN_PRODUCTS_TARGET
             )
             if llm_ranked:
-                final_products = llm_ranked
+                final_products = _brand_cap(llm_ranked, Config.MAX_PER_BRAND_DISPLAY)
 
         web_products: List[Dict[str, Any]] = []
         if len(final_products) < Config.MIN_PRODUCTS_TARGET:
@@ -1760,7 +1919,9 @@ async def t_search_fashion_products(
 
         storage_limit = max(Config.FINAL_RERANK_TOP_K, Config.DISPLAY_PRODUCTS_COUNT)
         stored_products = final_products[:storage_limit]
-        display_products = stored_products[: Config.DISPLAY_PRODUCTS_COUNT]
+        display_products = await _pick_displayable_products(
+            stored_products, Config.DISPLAY_PRODUCTS_COUNT
+        )
         logger.debug(
             "Display products order",
             titles=[p.get("title") for p in display_products],
