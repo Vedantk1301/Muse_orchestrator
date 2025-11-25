@@ -1,12 +1,14 @@
 import os
 import numpy as np
 import httpx
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# =========================
 # Configuration
+# =========================
 DI_OPENAI_BASE = os.getenv("DI_OPENAI_BASE", "https://api.deepinfra.com/v1/openai")
 DI_INFER_BASE = os.getenv("DI_INFER_BASE", "https://api.deepinfra.com/v1/inference")
 
@@ -16,6 +18,48 @@ REQUEST_TIMEOUT = int(os.getenv("DEEPINFRA_TIMEOUT", "90"))
 BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
 EXPECTED_EMBEDDING_DIM = int(os.getenv("EXPECTED_EMBEDDING_DIM", "3840"))
 
+# Default rerank instruction – short and domain-specific.
+# You can override with env RERANK_INSTRUCTION if you want to tweak copy.
+DEFAULT_RERANK_INSTRUCTION = os.getenv(
+    "RERANK_INSTRUCTION",
+    (
+        """
+        You are a fashion product reranker for an Indian shopping assistant.
+
+Input:
+- One user query.
+- A list of product documents. Each document may include brand, title, category, fabric, fit, price, and occasion tags.
+
+Goal:
+Rank the documents so that higher scores mean more relevant to the user query.
+
+Relevance rules:
+1. Match product type (shirt, kurta, dress, trousers, co-ord, sneakers, etc.).
+2. Match fabric, fit, colour family, and the overall vibe (casual, work, travel, date, festive).
+3. Respect gender hints (men, women, unisex) when present.
+4. If the query mentions budget, prefer products whose INR price is closer to the mentioned range.
+5. Exact keyword match is NOT required; semantic, silhouette, and vibe match are more important.
+
+Diversity rules (important for top results):
+1. In the top 8 results, prefer at least 3–4 different brands if possible.
+2. Avoid placing many items from the same brand consecutively when good alternatives exist.
+3. Prefer mixing silhouettes when multiple types fit the query (e.g., a couple of shirts, a polo, a lightweight overshirt), instead of returning 8 near-duplicates.
+4. Diversity should never override clear irrelevance. Always keep unrelated products low.
+
+Scoring guidance:
+- Give higher scores to documents that best balance query relevance and diversity.
+- Do not overvalue repeated wording or near-duplicate titles from a single brand.
+- Do not penalize shorter descriptions as long as relevance signals are clear.
+
+Output:
+Return scores that, when sorted descending, produce a relevant and diverse ranked list of products.
+""".strip()
+    )
+)
+
+# =========================
+# Embeddings
+# =========================
 
 async def embed_catalog(texts: List[str]) -> List[List[float]]:
     """
@@ -83,24 +127,48 @@ async def embed_catalog(texts: List[str]) -> List[List[float]]:
         raise
 
 
+# =========================
+# Reranker
+# =========================
+
+def _truncate_instruction(text: str, max_len: int = 1900) -> str:
+    """
+    DeepInfra caps instruction at 2048 chars.
+    We keep a little headroom to be safe.
+    """
+    if not text:
+        return text
+    text = text.strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len]
+
+
 async def rerank_qwen(
     query: str,
     documents: List[str],
-    top_k: int = 8
+    top_k: int = 8,
+    instruction: Optional[str] = None,
+    service_tier: str = "default",
 ) -> List[int]:
     """
-    Rerank documents using Qwen3-Reranker-4B.
+    Rerank documents using Qwen3-Reranker-4B via DeepInfra.
     
     Args:
         query: Search query string
         documents: List of document strings to rerank
         top_k: Number of top results to return
+        instruction: Optional reranking instruction to guide the model.
+                     If None, uses DEFAULT_RERANK_INSTRUCTION.
+        service_tier: DeepInfra service tier ('default' or 'priority')
         
     Returns:
         List of indices in reranked order (best first)
         
-    Raises:
-        httpx.HTTPError: If API request fails
+    Notes:
+        - We send a single query and N documents.
+        - DeepInfra's schema says queries/documents should match in length,
+          but this API works in practice with [query] + list-of-docs.
     """
     if not documents:
         return []
@@ -111,8 +179,26 @@ async def rerank_qwen(
     token = os.getenv("DEEPINFRA_TOKEN")
     if not token:
         raise ValueError("DEEPINFRA_TOKEN not set in environment")
+
+    # Pick instruction (env override > default) and enforce length
+    if instruction is None:
+        instruction = DEFAULT_RERANK_INSTRUCTION
+    instruction = _truncate_instruction(instruction, max_len=1900)
     
     try:
+        payload: dict = {
+            "queries": [query],
+            "documents": documents,
+        }
+
+        # Only attach instruction if it is non-empty
+        if instruction:
+            payload["instruction"] = instruction
+
+        # Optional: include service_tier if you ever want to use 'priority'
+        if service_tier in ("default", "priority"):
+            payload["service_tier"] = service_tier
+        
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, trust_env=False) as client:
             response = await client.post(
                 f"{DI_INFER_BASE}/{RERANK_MODEL}",
@@ -120,18 +206,16 @@ async def rerank_qwen(
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json"
                 },
-                json={
-                    "queries": [query],
-                    "documents": documents
-                }
+                json=payload,
             )
             response.raise_for_status()
             result = response.json()
         
         # Extract scores (handle both single query and batch formats)
         scores = result.get("scores", [])
+        # Some rerankers return [[...scores per doc...]] for batched queries
         if scores and isinstance(scores[0], list):
-            scores = scores[0]  # Unwrap batch dimension
+            scores = scores[0]
         
         if not scores:
             print("[rerank_qwen] No scores returned, using original order")
@@ -160,7 +244,9 @@ async def rerank_qwen(
         return list(range(min(top_k, len(documents))))
 
 
-# ========== Utility Functions ==========
+# =========================
+# Utility Functions
+# =========================
 
 def validate_embedding_dimension(embeddings: List[List[float]], expected_dim: int = None):
     """
@@ -190,7 +276,7 @@ async def batch_embed_catalog(
         Concatenated list of all embeddings
     """
     batch_size = batch_size or BATCH_SIZE
-    all_embeddings = []
+    all_embeddings: List[List[float]] = []
     
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]

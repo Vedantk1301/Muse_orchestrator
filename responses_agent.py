@@ -129,10 +129,11 @@ class Config:
     MIN_PRODUCTS_TARGET = int(os.getenv("MIN_PRODUCTS_TARGET", "8"))
     NUMERIC_RERANK_POOL = int(os.getenv("NUMERIC_RERANK_POOL", "30"))
     LLM_RERANK_INPUT_LIMIT = int(os.getenv("LLM_RERANK_INPUT_LIMIT", "20"))
-    BRAND_CAP_PER_WINDOW = int(os.getenv("BRAND_CAP_PER_WINDOW", "3"))
+    BRAND_CAP_PER_WINDOW = int(os.getenv("BRAND_CAP_PER_WINDOW", "6"))
     BRAND_CAP_WINDOW = int(os.getenv("BRAND_CAP_WINDOW", "32"))
     WEB_TOPUP_MIN_COUNT = int(os.getenv("WEB_TOPUP_MIN_COUNT", "2"))
     USE_LLM_RERANK = os.getenv("USE_LLM_RERANK", "0") == "1"
+    USE_LLM_RERANK = False
     MAX_PER_BRAND_DISPLAY = int(os.getenv("MAX_PER_BRAND_DISPLAY", "4"))
 
     SEARCH_CACHE_TTL_HOURS = 24
@@ -1725,18 +1726,6 @@ async def t_search_fashion_products(
                             match=rest.MatchText(text=cat),
                         )
                     )
-                    should_conditions.append(
-                        rest.FieldCondition(
-                            key="category_path",
-                            match=rest.MatchAny(any=[cat]),
-                        )
-                    )
-                    should_conditions.append(
-                        rest.FieldCondition(
-                            key="category_leaf",
-                            match=rest.MatchText(text=cat),
-                        )
-                    )
 
                 if gender_filter_value:
                     must_conditions.append(
@@ -1882,33 +1871,37 @@ async def t_search_fashion_products(
             if llm_ranked:
                 final_products = _brand_cap(llm_ranked, Config.MAX_PER_BRAND_DISPLAY)
 
-        web_products: List[Dict[str, Any]] = []
-        if len(final_products) < Config.MIN_PRODUCTS_TARGET:
-            needed = Config.MIN_PRODUCTS_TARGET - len(final_products)
-            existing_keys = {
-                key
-                for key in (_product_identity(p) for p in final_products)
-                if key
-            }
-            web_products = await _fetch_web_topup_products(
-                query, existing_keys, needed
-            )
-            if web_products:
-                logger.info(
-                    'Using web search fallback',
-                    added=len(web_products),
-                    needed=needed,
-                )
-                base_with_web = _dedupe_products((base_products or []) + web_products)
-                reranked = await _llm_rerank_products(
-                    query, base_with_web, Config.MIN_PRODUCTS_TARGET
-                )
-                final_products = reranked or base_with_web
-            else:
-                logger.warning(
-                    'Web search fallback returned nothing',
-                    requested=needed,
-                )
+        # ❌ DISABLED: Automatic web search fallback (too slow, ~38s)
+        # Instead, the orchestrator will ask the user if they want web search
+        # when catalog results are insufficient
+        
+        # web_products: List[Dict[str, Any]] = []
+        # if len(final_products) < Config.MIN_PRODUCTS_TARGET:
+        #     needed = Config.MIN_PRODUCTS_TARGET - len(final_products)
+        #     existing_keys = {
+        #         key
+        #         for key in (_product_identity(p) for p in final_products)
+        #         if key
+        #     }
+        #     web_products = await _fetch_web_topup_products(
+        #         query, existing_keys, needed
+        #     )
+        #     if web_products:
+        #         logger.info(
+        #             'Using web search fallback',
+        #             added=len(web_products),
+        #             needed=needed,
+        #         )
+        #         base_with_web = _dedupe_products((base_products or []) + web_products)
+        #         reranked = await _llm_rerank_products(
+        #             query, base_with_web, Config.MIN_PRODUCTS_TARGET
+        #         )
+        #         final_products = reranked or base_with_web
+        #     else:
+        #         logger.warning(
+        #             'Web search fallback returned nothing',
+        #             requested=needed,
+        #         )
 
         ranked_products: List[Dict[str, Any]] = []
         for idx, product in enumerate(final_products, 1):
@@ -1935,7 +1928,6 @@ async def t_search_fashion_products(
             "queries_used": queries,
             "best_score": best_score,
             "total_candidates": total_candidates,
-            "web_topup_count": len(web_products),
             "_all_products": stored_products,
         }
 
@@ -2258,6 +2250,7 @@ OVERALL UX VIBE:
   - Maximum 1 or 2 short sentences before the product bullets.
   - Use a bullet list for products, then ONE short follow up question.
   - Use 2 or 3 emojis in most answers (at least 1). Playful but not cringe.
+- The ACK already greets; in the main reply do NOT greet again. Skip "Hi/Hey/Hello" and jump straight to the fit or next step.
 - Less lecture, more looks.
 - Never use long punctuation dashes like — or –. Use commas, full stops, or emojis instead.
 - Never use the rainbow emoji.
@@ -2287,29 +2280,6 @@ OVERALL UX VIBE:
 - For normal “office”, “meeting”, “interview”:
   - Talk in terms of modern Indian office wear: shirts, chinos, minimal sneakers or loafers, sometimes blazers or suits.
 - For “travel to <city> in <month> or next week”:
-  - Mention the climate in one short line.
-  - If month or season is unclear, ask ONE small clarifying question:
-    - “Which month are you going, May vs December is very different”
-
-4) Product grounding:
-- The function “search_fashion_products” is your only source of real products, brands, and prices. Call it ONCE per user ask; it already fans out discovery/pairing queries, reranks (vector + LLM), and guarantees at least 8 relevant products with a web-search fallback when the catalog is thin.
-- Never invent a brand or product that is not in the tool output.
-- When the products list is non empty:
-  - Treat them as valid matches and speak from that list.
-  - Show up to 8 bullets by default (the UI only displays the top 8). For broader discovery or if the user explicitly asks for more, you may reference additional cached products.
-  - **IMPORTANT**: The `products` array already has the best-first ranking. Mention the pieces in that exact order (rank ascending) and do not reshuffle or interleave by vibe.
-  - Bullet style must be aesthetic, for example:
-    - “A crisp light blue cotton shirt from Rare Rabbit, sharp contrast with navy trousers for office days 🙂”
-    - “A relaxed navy shacket from Cultstore, throw on over a tee and chinos for casual dates 😌”
-  - Do not list sizes, prices, or color arrays unless the user explicitly asks about budget, size, or color.
-- Only when products is empty:
-  - Say “I do not have good matches for that in the catalog right now”.
-  - Then give high level outfit advice without fabricating specific SKUs.
-
-5) Tool usage:
-- For any outfit, clothing, shoes, or shopping question:
-  - Make ONE call to “search_fashion_products” early, even if information is incomplete. Let the tool handle its own multi-query fan-out and reranking; do not spam multiple calls in the same reply unless the user clearly asks for a totally different category later.
-- For pairing or discovery questions (e.g., “what goes with navy trousers”):
   - Set `search_type="discovery"` (or leave it blank/auto) so the tool automatically generates 3 concise queries and reranks them.
   - Use a neutral but relevant query phrase like “smart casual shirts India” or “knit polos for office India”, then pick colours in the answer.
 - When building the search query string:
@@ -2541,6 +2511,13 @@ async def run_conversation(
         {
             "role": "system",
             "content": f"Context: UserID={user_id} | ThreadID={thread_id}",
+        },
+        {
+            "role": "system",
+            "content": (
+                "An ACK has already been sent to the user. In this main reply, do NOT greet again or repeat their name. "
+                "Start directly with the outfit/help and follow the product-forward rules."
+            ),
         },
     ]
 
