@@ -6,19 +6,30 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# =========================
-# Configuration
-# =========================
+# DeepInfra / model configuration (env overridable)
 DI_OPENAI_BASE = os.getenv("DI_OPENAI_BASE", "https://api.deepinfra.com/v1/openai")
 DI_INFER_BASE = os.getenv("DI_INFER_BASE", "https://api.deepinfra.com/v1/inference")
-
+# Default to a lightweight Llama on DeepInfra; override via env if desired.
+DI_CHAT_MODEL = os.getenv(
+    "DI_CHAT_MODEL",
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+)
 EMB_MODEL_CATALOG = os.getenv("EMB_MODEL_CATALOG", "Qwen/Qwen3-Embedding-4B")
 RERANK_MODEL = os.getenv("RERANK_MODEL", "Qwen/Qwen3-Reranker-4B")
-REQUEST_TIMEOUT = int(os.getenv("DEEPINFRA_TIMEOUT", "90"))
-BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
 EXPECTED_EMBEDDING_DIM = int(os.getenv("EXPECTED_EMBEDDING_DIM", "3840"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "8.0"))
 
-# Default rerank instruction – short and domain-specific.
+# Lightweight logger helper so we can surface errors to the main agent logger when provided.
+def _log_error(logger, message: str, **kwargs):
+    if logger:
+        try:
+            logger.error(message, **kwargs)
+            return
+        except Exception:
+            pass
+    print(f"[deepinfra] {message}: {kwargs}")
+
 # You can override with env RERANK_INSTRUCTION if you want to tweak copy.
 DEFAULT_RERANK_INSTRUCTION = os.getenv(
     "RERANK_INSTRUCTION",
@@ -292,3 +303,136 @@ async def batch_embed_catalog(
             all_embeddings.extend([[0.0] * EXPECTED_EMBEDDING_DIM for _ in batch])
     
     return all_embeddings
+
+
+# =========================
+# Quick Options Generation
+# =========================
+
+async def generate_quick_options(
+    prompt: str,
+    context: str = "",
+    hint: str = None,
+    logger=None,
+) -> List[str]:
+    """
+    Generate 3-5 short, clickable options using a fast DeepInfra model.
+    
+    Args:
+        prompt: The bot's message or current context
+        context: Additional context (user message, conversation history)
+        hint: Optional hint about what kind of options to generate:
+            - "product_refinement": After showing products (price filters, colors, pairing)
+            - "question": Answering a question (Menswear/Womenswear/Neutral, etc.)
+            - None: Auto-detect from prompt
+        logger: Optional agent logger for visibility on failures
+    """
+    token = os.getenv("DEEPINFRA_TOKEN")
+    if not token:
+        return []
+
+    # Customize system prompt based on hint
+    if hint == "product_refinement":
+        system_prompt = (
+            "You are a UI helper for a fashion chatbot. "
+            "The bot just showed products to the user. Generate 3-5 short refinement options. "
+            "Rules:\\n"
+            "1. Output ONLY a JSON list of strings. Example: [\\\"Under 3k\\\", \\\"Different colors\\\", \\\"What goes well with this\\\"]\\n"
+            "2. Keep options very short (2-4 words).\\n"
+            "3. Common product refinement options: \\\"Under Xk\\\", \\\"Different colors\\\", \\\"Similar items\\\", \\\"What goes well\\\", \\\"Show more\\\"\\n"
+            "4. Do NOT output markdown code blocks, just the raw JSON string.\\n"
+            "5. If context unclear, return generic refinements.\\n"
+        )
+    elif hint == "question":
+        system_prompt = (
+            "You are a UI helper for a fashion chatbot. "
+            "The bot asked the user a question. Generate 3-4 short answer options. "
+            "Rules:\\n"
+            "1. Output ONLY a JSON list of strings. Example: [\\\"Menswear\\\", \\\"Womenswear\\\", \\\"Neutral\\\"]\\n"
+            "2. Keep options very short (1-3 words).\\n"
+            "3. Provide direct answers to the question asked.\\n"
+            "4. Do NOT output markdown code blocks, just the raw JSON string.\\n"
+            "5. If no obvious options, return an empty list [].\\n"
+        )
+    else:
+        # Auto-detect
+        system_prompt = (
+            "You are a UI helper for a fashion chatbot. "
+            "Your job is to read the bot's last message and generate 3-5 short, relevant, clickable options (chips) for the user. "
+            "Rules:\\n"
+            "1. Output ONLY a JSON list of strings. Example: [\\\"Menswear\\\", \\\"Womenswear\\\", \\\"Neutral\\\"]\\n"
+            "2. Keep options very short (1-4 words).\\n"
+            "3. If the bot asks a question, provide answer choices.\\n"
+            "4. If the bot shows products, provide refinements (e.g. \\\"Under 3k\\\", \\\"Different colors\\\", \\\"What goes well\\\").\\n"
+            "5. Do NOT output markdown code blocks, just the raw JSON string.\\n"
+            "6. If no obvious options exist, return an empty list [].\\n"
+        )
+
+    user_content = f"Bot Message: {prompt}\\n"
+    if context:
+        user_content += f"Context: {context}\\n"
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, trust_env=False) as client:
+            response = await client.post(
+                f"{DI_OPENAI_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": DI_CHAT_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content}
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 100,
+                    "response_format": {"type": "json_object"}
+                }
+            )
+            
+            if response.status_code != 200:
+                _log_error(
+                    logger,
+                    "generate_quick_options API error",
+                    status=response.status_code,
+                    response_text=response.text[:500],
+                )
+                return []
+                
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            
+            # Parse JSON
+            import json
+            try:
+                # Handle potential wrapping in {"options": [...]} or just [...]
+                parsed = json.loads(content)
+                if isinstance(parsed, list):
+                    return parsed[:5]
+                if isinstance(parsed, dict):
+                    # Look for common keys
+                    for key in ["options", "chips", "suggestions", "choices"]:
+                        if key in parsed and isinstance(parsed[key], list):
+                            return parsed[key][:5]
+                    # Fallback: return values if they are strings
+                    return [str(v) for v in parsed.values() if isinstance(v, (str, int, float))][:5]
+                _log_error(
+                    logger,
+                    "generate_quick_options unexpected JSON structure",
+                    content=str(content)[:500],
+                )
+                return []
+            except json.JSONDecodeError as e:
+                _log_error(
+                    logger,
+                    "generate_quick_options JSON decode failed",
+                    error=str(e),
+                    content=str(content)[:500],
+                )
+                return []
+
+    except Exception as e:
+        _log_error(logger, "generate_quick_options failed", error=str(e))
+        return []

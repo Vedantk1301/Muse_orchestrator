@@ -119,18 +119,18 @@ class Config:
     MAX_LATENCY_MS = int(os.getenv("MAX_LATENCY_MS", "45000"))
 
     CATALOG_COLLECTION = os.getenv("CATALOG_COLLECTION", "fashion_qwen4b_text")
-    HNSW_EF = int(os.getenv("HNSW_EF", "500"))
+    HNSW_EF = int(os.getenv("HNSW_EF", "256"))
 
     SIMPLE_SEARCH_LIMIT = 15
     DISCOVERY_QUERIES = int(os.getenv("DISCOVERY_QUERIES", "4"))
-    PRODUCTS_PER_QUERY = 60
-    RERANK_PER_QUERY = int(os.getenv("RERANK_PER_QUERY", "40"))
+    PRODUCTS_PER_QUERY = 40
+    RERANK_PER_QUERY = int(os.getenv("RERANK_PER_QUERY", "25"))
     RERANK_MIN_PER_QUERY = int(os.getenv("RERANK_MIN_PER_QUERY", "2"))
     FINAL_RERANK_TOP_K = 16
     DISPLAY_PRODUCTS_COUNT = int(os.getenv("DISPLAY_PRODUCTS_COUNT", "8"))
     MIN_PRODUCTS_TARGET = int(os.getenv("MIN_PRODUCTS_TARGET", "8"))
     CATALOG_MIN_RESULTS = int(os.getenv("CATALOG_MIN_RESULTS", "4"))  # below this, ask for web approval
-    NUMERIC_RERANK_POOL = int(os.getenv("NUMERIC_RERANK_POOL", "60"))
+    NUMERIC_RERANK_POOL = int(os.getenv("NUMERIC_RERANK_POOL", "40"))
     RERANK_POOL_BRAND_CAP = int(os.getenv("RERANK_POOL_BRAND_CAP", "2"))
     LLM_RERANK_INPUT_LIMIT = int(os.getenv("LLM_RERANK_INPUT_LIMIT", "20"))
     BRAND_CAP_PER_WINDOW = int(os.getenv("BRAND_CAP_PER_WINDOW", "6"))
@@ -140,11 +140,11 @@ class Config:
     USE_LLM_RERANK = False
     USE_WEB_TOPUP = os.getenv("USE_WEB_TOPUP", "0") == "1"
     MAX_PER_BRAND_DISPLAY = int(os.getenv("MAX_PER_BRAND_DISPLAY", "4"))
+    CHECK_IMAGES = os.getenv("CHECK_IMAGES", "0") == "1"
 
     SEARCH_CACHE_TTL_HOURS = 24
     INTENT_CACHE_TTL_SECONDS = 1800
 
-    # Trend + Weather cache
     # Trends: keep in memory and on disk for ~24 hours
     TRENDS_CACHE_TTL_SECONDS = int(os.getenv("TRENDS_CACHE_TTL_SECONDS", "86400"))
     WEATHER_CACHE_TTL_SECONDS = int(os.getenv("WEATHER_CACHE_TTL_SECONDS", "600"))
@@ -194,6 +194,24 @@ class TTLCache:
                 self._store = {
                     k: v for k, v in self._store.items() if v[0] > cutoff
                 }
+
+
+
+def cheap_ack(message: str) -> Optional[str]:
+    """
+    Returns a simple static ACK if the message is a greeting.
+    Returns None if it's a task/query (so we skip ACK).
+    """
+    import random
+    text = message.lower().strip()
+    
+    # Greetings -> fast ACK
+    greetings = {"hi", "hey", "hello", "hola", "yo", "heya"}
+    if text in greetings or any(text.startswith(g) for g in ["hi ", "hey ", "hello "]):
+        return random.choice(["Hi! 🙂", "Hey there! 👋", "Hello! 😊", "Hey! ✨"])
+        
+    # Everything else -> No ACK (return None)
+    return None
 
 
 SEARCH_CACHE = TTLCache(Config.SEARCH_CACHE_TTL_HOURS * 3600)
@@ -846,7 +864,7 @@ INTENT_SYSTEM_PROMPT = """
 You are a fashion search intent classifier for an India-first stylist bot.
 
 You receive a short JSON like:
-{"query": "...", "gender_context": "for women" | "for men" | "", "forced_type": "specific" | "discovery" | "pairing" | null}
+{"query": "...", "gender_context": "for women" | "for men" | "", "forced_type": "specific" | "discovery" | "pairing" | null, "product_context": "..." | null}
 
 You must output ONLY a JSON object (no prose, no markdown, no backticks) in this format:
 
@@ -882,6 +900,28 @@ Gender context:
 - If "gender_context" == "for women", use womenswear silhouettes.
 - If "gender_context" == "for men", use menswear silhouettes.
 - If empty or missing, stay neutral.
+
+QUERY CONTEXT (REFINEMENTS - CRITICAL):
+- If "last_query_context" is provided:
+  - Check if the current query is a PURE REFINEMENT (price filter, color, fabric) or a NEW TOPIC.
+  - PURE REFINEMENTS: "under 2000", "in blue", "cotton only", "size M"
+  - NEW TOPICS: "party wear", "office clothes", "travel to Tokyo"
+  
+- If PURE REFINEMENT:
+  - The user wants to FILTER the previous search, not start over.
+  - Look at the EXISTING queries from last_query_context.
+  - APPEND the filter to each existing query.
+  - Example: Context="traveling to Dubai [queries: linen maxi dress, cotton kurta palazzo]", Query="under 2000"
+    -> Output queries=["linen maxi dress under 2000", "cotton kurta palazzo under 2000", "breathable jumpsuit under 2000"]
+  
+- If NEW TOPIC:
+  - Ignore last_query_context and generate fresh queries for the new topic.
+
+PRODUCT CONTEXT (CRITICAL):
+- If "product_context" is provided (e.g. "User just saw: Blue linen shirt"), and the query is context-dependent (e.g. "pair this", "what goes with it", "shoes for this"):
+  - Use the product context to generate specific pairing queries.
+  - Example: Context="Blue linen shirt", Query="pair this" -> Output queries=["beige chinos", "white sneakers", "navy trousers"]
+- If the query is NOT context-dependent (e.g. "red dress"), ignore the product context.
 
 INDIA-FIRST LOGIC (VERY IMPORTANT):
 
@@ -1109,12 +1149,14 @@ async def t_classify_intent(
     query: str,
     user_gender: Optional[str] = None,
     forced_type: Optional[str] = None,
+    product_context: Optional[str] = None,
+    last_query_context: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Classify the fashion search intent. Uses FAST_MODEL (Responses API) with
     very explicit JSON instructions in the system prompt.
     """
-    cache_key = _cache_key("intent", query.lower(), forced_type or "", user_gender or "")
+    cache_key = _cache_key("intent", query.lower(), forced_type or "", user_gender or "", product_context or "", last_query_context or "")
     cached = await INTENT_CACHE.get(cache_key)
     if cached:
         logger.debug("💾 intent cache HIT")
@@ -1143,6 +1185,10 @@ async def t_classify_intent(
         user_content_dict["gender_context"] = gender_term
     if forced_type:
         user_content_dict["forced_type"] = forced_type
+    if product_context:
+        user_content_dict["product_context"] = product_context
+    if last_query_context:
+        user_content_dict["last_query_context"] = last_query_context
 
     user_content = json.dumps(user_content_dict)
 
@@ -1303,6 +1349,9 @@ async def _pick_displayable_products(
     if desired <= 0 or not products:
         return []
 
+    if not Config.CHECK_IMAGES:
+        return products[:desired]
+
     max_checks = min(len(products), desired + 4)
     subset = products[:max_checks]
     sem = asyncio.Semaphore(8)
@@ -1460,7 +1509,9 @@ async def _llm_rerank_products(
                 "brand": product.get("brand"),
                 "category_leaf": product.get("category") or product.get("category_leaf"),
                 "score": round(float(product.get("score", 0.0)), 4),
+                "score": round(float(product.get("score", 0.0)), 4),
                 "source": product.get("from_query") or product.get("source") or "catalog",
+                "price": product.get("price_inr") or product.get("price") or "Unknown",
             }
         )
 
@@ -1584,12 +1635,6 @@ async def _fetch_web_topup_products(
             request_count,
         )
         web_ms = int((time.perf_counter() - web_t0) * 1000)
-        logger.perf(
-            "web_search_topup",
-            web_ms,
-            requested=request_count,
-            received=len(web_results),
-        )
     except Exception as e:
         logger.error("web_search_topup_failed", error=str(e))
         return []
@@ -1700,9 +1745,35 @@ async def t_search_fashion_products(
         # - auto / discovery / pairing => classifier with optional forced type
         # - specific => just one query
         ql = query.lower()
+
+        # 🆕 Extract product context from budget if available
+        product_context = None
+        if budget and budget.last_products:
+            # Create a short summary of the last 3 products
+            titles = [p.get("title", "item") for p in budget.last_products[:3]]
+            product_context = f"User just saw: {', '.join(titles)}"
+            logger.info(f"📋 Using product context: {product_context}")
+
+        # 🆕 Extract last query context from budget (use original query + queries_used)
+        last_query_context = None
+        if budget and budget.last_search_result:
+            original_q = budget.last_search_result.get("original_query")
+            prev_queries = budget.last_search_result.get("queries_used") or []
+            if original_q and prev_queries:
+                # Format: "original intent [queries: q1, q2, q3]"
+                queries_str = ", ".join(prev_queries[:3])
+                last_query_context = f"{original_q} [queries: {queries_str}]"
+                logger.info(f"📋 Using last query context: {last_query_context}")
+
         if search_type in ("auto", "discovery", "pairing"):
             forced_type = None if search_type == "auto" else search_type
-            intent = await t_classify_intent(query, user_gender, forced_type=forced_type)
+            intent = await t_classify_intent(
+                query, 
+                user_gender, 
+                forced_type=forced_type, 
+                product_context=product_context,
+                last_query_context=last_query_context
+            )
             search_type = intent.get("search_type", "specific")
             queries = intent.get("queries", [query])
             if forced_type:
@@ -1951,6 +2022,7 @@ async def t_search_fashion_products(
             "web_topup_count": len(web_products),
             "search_type": search_type,
             "queries_used": queries,
+            "original_query": query,
             "best_score": best_score,
             "total_candidates": total_candidates,
             "_all_products": stored_products,
@@ -1991,22 +2063,11 @@ async def t_search_fashion_products(
 # =============================================================================
 # Post-search suggestions (chips) – Under ₹5000, colours, pairing
 # =============================================================================
-async def t_generate_search_suggestions(
+async def _generate_search_suggestions(
     query: str, context: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Generate 3-4 *refinement suggestions* to show AFTER products.
-
-    These are NOT new search queries fired automatically.
-    They are UI chips the user can click, like:
-      - "Under ₹5000"
-      - "Show different colours"
-      - "Pair this with something"
-
-    The assistant should:
-      - show these suggestions after listing products
-      - ask the user which one they prefer
-      - only then call search_fashion_products again with a refined query / filters.
+    Internal helper to generate 3-4 *refinement suggestions* to show AFTER products.
     """
     ql = query.lower()
     suggestions: List[Dict[str, Any]] = []
@@ -2138,19 +2199,121 @@ async def t_tone_reply(
 # =============================================================================
 # Show Options (Chips)
 # =============================================================================
-async def t_show_options(options: List[str]) -> Dict[str, Any]:
+async def _generate_quick_options_local(
+    context: str,
+    hint: Optional[str],
+    logger: Logger,
+) -> List[str]:
     """
-    Display clickable UI chips/buttons to the user.
+    Generate short clickable options using the OpenAI FAST model directly.
     """
-    logger.info("🔘 show_options", options=options)
-    return {"options": options}
+    if not context:
+        return []
+
+    system_prompt = (
+        "You are a UI helper for a fashion chatbot.\n"
+        "Given the bot's last message, return 3-5 short clickable options as JSON array of strings.\n"
+        "Rules:\n"
+        "1) ONLY output a JSON list of strings like [\"Menswear\", \"Womenswear\", \"Neutral\"].\n"
+        "2) Keep options very short (1-4 words).\n"
+        "3) If no clear options, return [].\n"
+        "4) If hint='product_refinement', generate ACTIONS like 'Under ₹2000', 'Show matching footwear', 'Different colors'. Do NOT just repeat attributes like 'Cotton' or 'Blue'.\n"
+        "5) If hint='question', generate the specific answer choices implied by the question.\n"
+    )
+
+    user_lines = [f"Bot message: {context}"]
+    if hint:
+        user_lines.append(f"Hint: {hint}")
+    user_content = "\n".join(user_lines)
+
+    def _strip_fences(text: str) -> str:
+        t = text.strip()
+        if t.startswith("```"):
+            # remove starting fence
+            t = t.split("\n", 1)[1] if "\n" in t else t[3:]
+        t = t.rstrip("` \n\r\t")
+        if t.endswith("```"):
+            t = t.rsplit("```", 1)[0].rstrip()
+        return t.strip()
+
+    try:
+        resp = await asyncio.to_thread(
+            client.responses.create,
+            model=Config.FAST_MODEL,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            reasoning = {"effort":"low"},
+            max_output_tokens=500,
+        )
+        raw = (resp.output_text or "").strip()
+        if not raw:
+            logger.warning("Quick options empty response")
+            return []
+        cleaned = _strip_fences(raw)
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed if isinstance(x, (str, int, float))][:5]
+        if isinstance(parsed, dict):
+            for key in ("options", "choices", "chips", "suggestions"):
+                if key in parsed and isinstance(parsed[key], list):
+                    return [
+                        str(x) for x in parsed[key] if isinstance(x, (str, int, float))
+                    ][:5]
+        logger.warning("Quick options JSON not a list/dict", raw=raw[:200])
+        return []
+    except json.JSONDecodeError as e:
+        logger.warning("Quick options JSON decode failed", error=str(e), raw=raw[:200])
+        return []
+    except Exception as e:
+        logger.error("Quick options generation failed", error=str(e))
+        return []
+
+async def t_show_options(
+    context: str = "",
+    hint: str = None,
+    budget: Optional["Budget"] = None
+) -> Dict[str, Any]:
+    """
+    Generate and display clickable UI chips/buttons to the user.
+    
+    Args:
+        context: Current conversation context (what the bot just said or showed)
+        hint: Optional hint for what kind of options to generate:
+            - "product_refinement": After showing products (price, colors, pairing)
+            - "question": Answering a question (Menswear/Womenswear/Neutral)
+            - None: Auto-detect from context
+        budget: Budget tracker to store options
+    
+    Returns:
+        Dict with "options" key containing list of suggestion strings
+    """
+    logger.info("🔘 show_options", context_len=len(context), hint=hint)
+    
+    try:
+        options = await _generate_quick_options_local(
+            context=context,
+            hint=hint,
+            logger=logger,
+        )
+        
+        if budget:
+            budget.last_options = options
+        
+        logger.info("✅ Options generated", count=len(options), options=options)
+        return {"options": options}
+    
+    except Exception as e:
+        logger.error("show_options failed", error=str(e))
+        return {"options": []}
 
 
 TOOLS_MAP = {
     "search_fashion_products": t_search_fashion_products,
     "tone_reply": t_tone_reply,
     "get_weather": t_get_weather,
-    "generate_search_suggestions": t_generate_search_suggestions,
+    # "generate_search_suggestions": t_generate_search_suggestions,
     "show_options": t_show_options,
 }
 
@@ -2221,39 +2384,29 @@ TOOLS_SCHEMA = [
     },
     {
         "type": "function",
-        "name": "generate_search_suggestions",
-        "description": (
-            "Generate 3–4 post-search refinement suggestions like 'Under ₹5000', "
-            "'Show different colours', or 'Pair this with something'. "
-            "Call this ONLY after you have already shown some products from search_fashion_products."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "context": {"type": "string"},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "type": "function",
         "name": "show_options",
         "description": (
-            "Show clickable UI buttons/chips to the user. "
-            "Use this whenever you ask a multiple-choice question (e.g. Gender, Budget, Occasion) "
-            "or when you want to offer quick replies."
+            "Generate and display 3-5 clickable suggestion chips to help the user respond. "
+            "Call this when:\n"
+            "1. After showing products: Use hint='product_refinement' to suggest options like 'Under 3k', 'Different colors', 'What goes well', 'Similar items'\n"
+            "2. When asking a question: Use hint='question' to provide answer choices like 'Menswear', 'Womenswear', 'Neutral'\n"
+            "3. Auto-detect: Leave hint=None to let the model decide based on context\n"
+            "IMPORTANT: Call this frequently to improve UX - after product displays, when asking questions, or offering refinements."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "options": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of short button labels (max 4-5 items)",
+                "context": {
+                    "type": "string",
+                    "description": "What you just said or showed to the user - this helps generate relevant options"
+                },
+                "hint": {
+                    "type": "string",
+                    "enum": ["product_refinement", "question", None],
+                    "description": "Optional hint: 'product_refinement' after products, 'question' when asking, or null for auto-detect"
                 },
             },
-            "required": ["options"],
+            "required": ["context"],
         },
     },
 ]
@@ -2266,7 +2419,7 @@ ASSUMPTIONS:
 - Assume the user is in India by default unless they clearly say otherwise.
 - You MUST determine the user's gender preference (Menswear, Womenswear, or Neutral) BEFORE searching.
 - EXCEPTION: Do NOT ask this in your very first "Hello" greeting. In the first greeting, just introduce yourself and ask for their name.
-- When the user asks for products (e.g. "I want shirts"), IF you don't know the gender yet, ask for it THEN (and use `show_options`).
+- When the user asks for products (e.g. "I want shirts"), IF you don't know the gender yet, ask for it THEN.
 - Do NOT search until you have this preference.
 
 CRITICAL GENDER RULE:
@@ -2280,7 +2433,7 @@ OVERALL UX VIBE:
   - Maximum 1 or 2 short sentences before the product bullets.
   - Use a bullet list for products, then ONE short follow up question.
   - Use 2 or 3 emojis in most answers (at least 1). Playful but not cringe.
-- The ACK already greets; in the main reply do NOT greet again. Skip "Hi/Hey/Hello" and jump straight to the fit or next step.
+- The ACK might have already greeted; in the main reply do NOT greet again unless it's the very first message. Skip "Hi/Hey/Hello" and jump straight to the fit or next step.
 - Less lecture, more looks.
 - Never use long punctuation dashes like — or –. Use commas, full stops, or emojis instead.
 - Never use the rainbow emoji.
@@ -2313,22 +2466,9 @@ OVERALL UX VIBE:
   - Set `search_type="discovery"` (or leave it blank/auto) so the tool automatically generates 3 concise queries and reranks them.
   - Use a neutral but relevant query phrase like “smart casual shirts India” or “knit polos for office India”, then pick colours in the answer.
 - When building the search query string:
-  - Keep it gender neutral (no “men/women”), “unisex” is OK.
-  - Do NOT include price or budget words like “under 2000”, “cheap”, “budget”; handle those via follow ups.
-- When the user refines with size, budget, colour, or vibe:
-  - You may call “search_fashion_products” again with that new filter, otherwise reuse the cached products.
-- Weather:
-  - If the user asks “what is the weather in <city> today or this week” or asks what to pack based on weather, you may call “get_weather”.
-  - Use the weather only as a short helper line to adjust fabrics and layers.
-  - Do not mention Open Meteo or any API by name in your reply.
-
-4) Catalog-first, web-search only with approval:
-- You must treat search_fashion_products as catalog-only by default. Never assume web data is available unless the user approves it.
-- After any call to search_fashion_products, check the counts in the tool output:
-  - If “catalog_count” >= 4: proceed normally, do NOT offer web search.
   - If “catalog_count” is 1–3: show those pieces, say the catalog is thin, and ask “Want me to search the web for more?”.
   - If “catalog_count” is 0: say “No good matches in the catalog”, then ask if they want web search or a refined query.
-- When you ask, show quick-reply chips via show_options: ["Yes, search the web", "No, stay in catalog"].
+- When you ask, offer quick-reply chips in text: ["Yes, search the web", "No, stay in catalog"].
 - Only if the user explicitly says yes (or clicks yes) should you call search_fashion_products again with allow_web_search=true to top up results.
 - If the user declines, stay in catalog mode and offer a refinement question instead of using the web.
 
@@ -2359,6 +2499,26 @@ OVERALL UX VIBE:
 - The question about name or gender should be separate from other questions and not spammy.
 - End each message with just one simple next step question.
 
+8) Smart Options (show_options tool):
+- Call "show_options" to provide clickable chips ONLY when there are clear, actionable choices.
+- When to call:
+  - AFTER calling search_fashion_products: Use hint="product_refinement"
+    - Example context: "I just showed you blue shirts"
+    - Generates: "Under 3k", "Different colors", "What goes well", "Similar items"
+  - WHEN asking for styling preferences with clear options: Use hint="question"
+    - Example context: "Do you prefer Menswear, Womenswear, or Neutral?"
+    - Generates: "Menswear", "Womenswear", "Neutral"
+  - For other cases: Leave hint=None for auto-detection
+- When NOT to call:
+  - Name questions ("What should I call you, you can skip if you like") - NO OPTIONS NEEDED
+  - Open-ended questions without clear choices
+  - Simple greetings or acknowledgments
+  - Follow-up clarifications
+- The context field should contain what you just said/showed
+- Call show_options at the END of your response, after your main message
+- Do NOT call show_options repeatedly or excessively - once per response maximum
+- IMPORTANT: Only call when the user would benefit from clickable suggestions, not every message
+
 8) Pairing and diversity:
 - For “what should I wear with X” or “what goes with navy trousers”:
   - Offer variety:
@@ -2384,7 +2544,7 @@ OVERALL UX VIBE:
   - Then send only the polished reply.
 
 11) Post-search suggestions:
-- After you call “search_fashion_products” and show some products, you may call “generate_search_suggestions” once.
+- After you call “search_fashion_products” and show some products, you may suggest refinement options in text.
 - Use its output to display 2 or 3 refinement options like:
   - “Under ₹5000”
   - “Show different colours”
@@ -2395,9 +2555,8 @@ OVERALL UX VIBE:
 
 12) Interactive Options:
 - Whenever you ask a question with clear choices (e.g. "Masculine or Feminine?", "Work or Party?", "Under 2k or 5k?"):
-  - Call the "show_options" tool with the list of choices.
-  - This will show clickable buttons to the user.
-  - Example: show_options(options=["Masculine", "Feminine", "Neutral"])
+  - Just list them in the text or ask clearly.
+  - Example: "Do you prefer Masculine, Feminine, or Neutral?"
 
 IMPORTANT:
 - Never respond with an empty message.
@@ -2555,7 +2714,7 @@ async def run_conversation(
         {
             "role": "system",
             "content": (
-                "An ACK has already been sent to the user. In this main reply, do NOT greet again or repeat their name. "
+                "An ACK might have been sent. In this main reply, do NOT greet again or repeat their name unless necessary. "
                 "Start directly with the outfit/help and follow the product-forward rules."
             ),
         },
@@ -2754,7 +2913,7 @@ async def _ensure_fallback_options(budget: Budget, user_message: str):
 
     try:
         logger.info("Auto generating fallback options", query=base_query)
-        response = await t_generate_search_suggestions(query=base_query, context=context)
+        response = await _generate_search_suggestions(query=base_query, context=context)
     except Exception as e:
         logger.warning("Fallback options generation failed", error=str(e))
         return
@@ -2795,49 +2954,21 @@ async def run_conversation_stream(
     logger.info("📡 STREAMING conversation", user_id=user_id, message=message[:50])
 
     ack_t0 = time.perf_counter()
-    try:
-        logger.info("⚡ Generating ACK")
-        ack_resp = await asyncio.to_thread(
-            client.responses.create,
-            model=Config.FAST_MODEL,
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are MuseBot, a helpful and stylish fashion assistant. \n"
-                        "Your goal: Acknowledge the user's message naturally and briefly. \n"
-                        "Rules:\n"
-                        "1. If the user says 'Hello', 'Hi', 'Hey': Reply with 'Hey there!', 'Hi!', 'Hello!'. \n"
-                        "2. If the user gives a task/preference: Say 'Got it', 'Sure', 'On it', 'Understood'. \n"
-                        "3. Max 5 words. An emoji or two to be used. \n"
-                        "4. NEVER say 'I will help you' or 'Let us fix your fits'. Be concise.\n"
-                        "5. Avoid overusing slang like 'Bet' or 'Say less' unless it fits perfectly. Keep it polite but modern."
-                    ),
-                },
-                *[{"role": m["role"], "content": m["content"]} for m in history[-4:] if "role" in m and "content" in m], # Context for ACK
-                {"role": "user", "content": message},
-            ],
-            reasoning={"effort": "low"},
-            max_output_tokens=500,
-        )
-        ack = (ack_resp.output_text or "").strip()
-        
-        # Debug empty response
-        if not ack:
-            logger.warning("⚠️ ACK response was empty", raw_resp=str(ack_resp))
-            import random
-            fallbacks = ["Bet!", "On it!", "Say less.", "Gotcha.", "Cooking that up...", "Yo, checking!"]
-            ack = random.choice(fallbacks)
-            
+    ack_t0 = time.perf_counter()
+    
+    # Cheap ACK logic
+    ack = cheap_ack(message)
+    if ack:
         ack_ms = int((time.perf_counter() - ack_t0) * 1000)
-        logger.success("✅ ACK generated", duration_ms=ack_ms, ack=ack)
-        yield ack
-    except Exception as e:
-        import random
-        fallbacks = ["Bet!", "On it!", "Say less.", "Gotcha.", "Cooking that up...", "Yo, checking!"]
-        fallback_ack = random.choice(fallbacks)
-        logger.warning("⚠️ ACK generation failed", error=str(e))
-        yield fallback_ack
+        logger.success("✅ ACK generated (local)", duration_ms=ack_ms, ack=ack)
+        yield f"__ACK__{ack}"
+    else:
+        logger.info("⏩ Skipping ACK (not a greeting)")
+        
+    # Old LLM ACK logic removed
+    # try:
+    #     logger.info("⚡ Generating ACK")
+    #     ack_resp = await asyncio.to_thread(...)
 
     await asyncio.sleep(0.1)
 

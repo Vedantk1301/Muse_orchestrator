@@ -112,20 +112,36 @@ async def bot_response(history, user_id):
     # Pass history excluding the last message (which is the current user message)
     generator = run_conversation_stream(user_id, last_user_msg, thread_id, history[:-1])
 
-    # 1. Get the ACK (first chunk)
+    # 1. Get the first chunk to check for ACK
     try:
-        ack_text = await anext(generator)
+        first_chunk = await anext(generator)
     except StopAsyncIteration:
-        ack_text = "..."
+        return
 
-    # Append ACK to history
-    history.append({"role": "assistant", "content": ack_text})
-    yield history, None, None
+    # Check if it's an ACK
+    if isinstance(first_chunk, str) and first_chunk.startswith("__ACK__"):
+        ack_text = first_chunk.replace("__ACK__", "")
+        # Yield ACK bubble
+        history.append({"role": "assistant", "content": ack_text})
+        yield history, None, None
+        
+        await asyncio.sleep(0.2)
+        
+        # Prepare for main response bubble
+        history.append({"role": "assistant", "content": "..."})
+        yield history, None, None
+        
+        # Consume next chunk for main response
+        try:
+            first_chunk = await anext(generator)
+        except StopAsyncIteration:
+            pass
+    else:
+        # No ACK, start main response immediately
+        history.append({"role": "assistant", "content": "..."})
+        yield history, None, None
 
-    await asyncio.sleep(0.2)
-
-    # 2. Prepare for the Real Response (New Bubble)
-    history.append({"role": "assistant", "content": "..."})
+    # Reset UI elements
     gallery_reset = gr.update(value=None, visible=False)
     chips_reset = gr.update(samples=[], visible=False)
     yield history, gallery_reset, chips_reset
@@ -134,33 +150,37 @@ async def bot_response(history, user_id):
     products: List[Dict[str, Any]] = []
     options: List[Any] = []
     
-    async for chunk in generator:
-        chunk_type, payload = _parse_stream_chunk(chunk)
-        if chunk_type == "products":
+    # Process the first chunk if it wasn't an ACK (or if we fetched a new one after ACK)
+    # We need to handle it exactly like the loop handles chunks
+    current_chunk = first_chunk
+    
+    # Helper to process a chunk
+    def process_chunk(c):
+        nonlocal full_response, products, options
+        c_type, payload = _parse_stream_chunk(c)
+        if c_type == "products":
             if isinstance(payload, list):
                 products = payload
                 agent_logger.info("UI received products", count=len(products))
-            else:
-                agent_logger.warning(
-                    "Products payload was not a list",
-                    payload_type=type(payload).__name__,
-                )
-            continue
-
-        if chunk_type == "options":
+            return False # Not text
+        if c_type == "options":
             if isinstance(payload, list):
                 options = payload
                 agent_logger.info("UI received options", count=len(options))
-            else:
-                agent_logger.warning(
-                    "Options payload was not a list",
-                    payload_type=type(payload).__name__,
-                )
-            continue
+            return False # Not text
+        
+        full_response += c
+        return True # Is text
 
-        full_response += chunk
-        history[-1]["content"] = full_response
-        yield history, None, None
+    if current_chunk:
+        if process_chunk(current_chunk):
+            history[-1]["content"] = full_response
+            yield history, None, None
+
+    async for chunk in generator:
+        if process_chunk(chunk):
+            history[-1]["content"] = full_response
+            yield history, None, None
 
     gallery_update = gr.update(value=None, visible=False)
     if products:
