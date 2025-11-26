@@ -124,16 +124,21 @@ class Config:
     SIMPLE_SEARCH_LIMIT = 15
     DISCOVERY_QUERIES = int(os.getenv("DISCOVERY_QUERIES", "4"))
     PRODUCTS_PER_QUERY = 60
+    RERANK_PER_QUERY = int(os.getenv("RERANK_PER_QUERY", "40"))
+    RERANK_MIN_PER_QUERY = int(os.getenv("RERANK_MIN_PER_QUERY", "2"))
     FINAL_RERANK_TOP_K = 16
     DISPLAY_PRODUCTS_COUNT = int(os.getenv("DISPLAY_PRODUCTS_COUNT", "8"))
     MIN_PRODUCTS_TARGET = int(os.getenv("MIN_PRODUCTS_TARGET", "8"))
-    NUMERIC_RERANK_POOL = int(os.getenv("NUMERIC_RERANK_POOL", "30"))
+    CATALOG_MIN_RESULTS = int(os.getenv("CATALOG_MIN_RESULTS", "4"))  # below this, ask for web approval
+    NUMERIC_RERANK_POOL = int(os.getenv("NUMERIC_RERANK_POOL", "60"))
+    RERANK_POOL_BRAND_CAP = int(os.getenv("RERANK_POOL_BRAND_CAP", "2"))
     LLM_RERANK_INPUT_LIMIT = int(os.getenv("LLM_RERANK_INPUT_LIMIT", "20"))
     BRAND_CAP_PER_WINDOW = int(os.getenv("BRAND_CAP_PER_WINDOW", "6"))
     BRAND_CAP_WINDOW = int(os.getenv("BRAND_CAP_WINDOW", "32"))
     WEB_TOPUP_MIN_COUNT = int(os.getenv("WEB_TOPUP_MIN_COUNT", "2"))
     USE_LLM_RERANK = os.getenv("USE_LLM_RERANK", "0") == "1"
     USE_LLM_RERANK = False
+    USE_WEB_TOPUP = os.getenv("USE_WEB_TOPUP", "0") == "1"
     MAX_PER_BRAND_DISPLAY = int(os.getenv("MAX_PER_BRAND_DISPLAY", "4"))
 
     SEARCH_CACHE_TTL_HOURS = 24
@@ -1370,7 +1375,7 @@ async def _numeric_rerank_products(user_query: str, products: List[Dict[str, Any
     remainder = products[pool_limit:]
 
     texts = [
-        f"{p.get('title') or ''} {p.get('category') or p.get('category_leaf') or ''}".strip()
+        f"{p.get('title') or ''} {p.get('category_path') or p.get('category') or p.get('category_leaf') or ''}".strip()
         for p in pool
     ]
     rerank_t0 = time.perf_counter()
@@ -1393,6 +1398,27 @@ async def _numeric_rerank_products(user_query: str, products: List[Dict[str, Any
             if pid:
                 seen.add(pid)
             ordered.append(product)
+
+        # Ensure each query keeps a minimum presence before we append the rest
+        if Config.RERANK_MIN_PER_QUERY > 0:
+            counts: Dict[Optional[str], int] = defaultdict(int)
+            for p in ordered:
+                counts[p.get("from_query")] += 1
+
+            by_query: Dict[Optional[str], List[Dict[str, Any]]] = defaultdict(list)
+            for p in pool:
+                by_query[p.get("from_query")].append(p)
+
+            for q, items in by_query.items():
+                while counts[q] < Config.RERANK_MIN_PER_QUERY and items:
+                    candidate = items.pop(0)
+                    pid = _product_identity(candidate)
+                    if pid and pid in seen:
+                        continue
+                    if pid:
+                        seen.add(pid)
+                    ordered.append(candidate)
+                    counts[q] += 1
 
         for product in pool:
             pid = _product_identity(product)
@@ -1613,6 +1639,7 @@ async def t_search_fashion_products(
     user_gender: Optional[str] = None,
     category_filter: Optional[str] = None,
     search_type: str = "auto",
+    allow_web_search: bool = False,
     budget: Optional[Budget] = None,
     user_message: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1620,6 +1647,7 @@ async def t_search_fashion_products(
     - Filters by user_gender when provided (Menswear -> men, Womenswear -> women).
     - For discovery / pairing: uses the 3 short fashion-only queries returned by t_classify_intent.
     - Combines products from all queries, dedupes by product id, then reranks (if needed).
+    - Web search top-up is disabled unless allow_web_search=True (only set after explicit user consent).
     """
 
     if budget and user_gender:
@@ -1629,6 +1657,8 @@ async def t_search_fashion_products(
     if budget and not user_gender and budget.user_gender:
         user_gender = budget.user_gender
         logger.info(f"♻️ Reusing saved gender: {user_gender}")
+
+    web_allowed = bool(Config.USE_WEB_TOPUP or allow_web_search)
 
 
     # Enforce that the base query comes from the user's latest message if provided
@@ -1654,7 +1684,7 @@ async def t_search_fashion_products(
         query = f"{query.strip()} {gender_phrase}".strip()
         ql = query.lower()
 
-    cache_key = _cache_key("search", query.lower(), search_type)
+    cache_key = _cache_key("search", query.lower(), search_type, user_gender, web_allowed)
     cached = await SEARCH_CACHE.get(cache_key)
     if cached:
         logger.success("💾 search cache HIT")
@@ -1714,43 +1744,7 @@ async def t_search_fashion_products(
 
         async def _search_one(q: str, vec: List[float]):
             def _do():
-                # Build filter conditions dynamically
-                must_conditions = []
-                should_conditions = []
-
-                cat = category_filter.strip().lower() if category_filter else None
-                if cat:
-                    should_conditions.append(
-                        rest.FieldCondition(
-                            key="category_path",
-                            match=rest.MatchText(text=cat),
-                        )
-                    )
-
-                if gender_filter_value:
-                    must_conditions.append(
-                        rest.FieldCondition(
-                            key="attributes.gender",
-                            match=rest.MatchValue(value=gender_filter_value),
-                        )
-                    )
-                
-                query_filter = None
-                if must_conditions or should_conditions:
-                    query_filter = rest.Filter(
-                        must=must_conditions or None,
-                        should=should_conditions or None,
-                    )
-
-                if query_filter:
-                    logger.debug(
-                        "Applying qdrant filter",
-                        category_filter=cat,
-                        gender_filter=gender_filter_value,
-                        must=len(must_conditions),
-                        should=len(should_conditions),
-                    )
-                
+                # No filters applied (category/gender disabled for debugging)
                 return Services.qdr.query_points(
                     collection_name=Config.CATALOG_COLLECTION,
                     query=vec,
@@ -1761,7 +1755,7 @@ async def t_search_fashion_products(
                     ),
                     with_payload=True,
                     search_params=rest.SearchParams(hnsw_ef=Config.HNSW_EF),
-                    query_filter=query_filter,
+                    query_filter=None,
                 )
 
             return await asyncio.to_thread(_do)
@@ -1778,7 +1772,7 @@ async def t_search_fashion_products(
         results_lists: List[List[Dict[str, Any]]] = []
         best_score = 0.0
         per_query = (
-            min(Config.FINAL_RERANK_TOP_K * 2, Config.PRODUCTS_PER_QUERY)
+            min(Config.RERANK_PER_QUERY, Config.PRODUCTS_PER_QUERY)
             if len(queries) > 1
             else Config.SIMPLE_SEARCH_LIMIT
         )
@@ -1804,12 +1798,6 @@ async def t_search_fashion_products(
                 score = float(point.score)
                 best_score = max(best_score, score)
 
-                image_url = payload.get('primary_image') or payload.get('image_url')
-                if not image_url:
-                    images = payload.get('images')
-                    if isinstance(images, list) and images:
-                        image_url = images[0]
-
                 card = {
                     'id': pid,
                     'product_id': pid,
@@ -1818,7 +1806,7 @@ async def t_search_fashion_products(
                     'category': payload.get('category_leaf'),
                     'category_leaf': payload.get('category_leaf'),
                     'category_path': payload.get('category_path'),
-                    'image_url': image_url,
+                    'image_url': payload.get('primary_image') or payload.get('image_url'),
                     'url': payload.get('url'),
                     'price': commerce.get('price'),
                     'price_inr': commerce.get('price_inr'),
@@ -1829,6 +1817,21 @@ async def t_search_fashion_products(
                 q_products.append(card)
             results_lists.append(q_products)
 
+            # Debug sample of raw Qdrant hits per query
+            try:
+                sample = [
+                    {
+                        "brand": p.get("brand"),
+                        "title": p.get("title"),
+                        "category_path": p.get("category_path"),
+                        "score": p.get("score"),
+                    }
+                    for p in q_products[:5]
+                ]
+                logger.debug("qdrant_raw_sample", query=q, count=len(q_products), top5=sample)
+            except Exception:
+                pass
+
         interleaved = _interleave_results(results_lists)
         candidates = _dedupe_products(interleaved)
         if len(queries) == 1:
@@ -1836,18 +1839,9 @@ async def t_search_fashion_products(
 
         total_candidates = len(candidates)
 
-        if candidates:
+        if candidates and Config.DEBUG:
             logger.debug(
-                "Brand mix pre-balance",
-                top_counts=_brand_histogram(candidates, 50),
-            )
-            candidates = _rebalance_brand_pool(
-                candidates,
-                Config.BRAND_CAP_PER_WINDOW,
-                Config.BRAND_CAP_WINDOW,
-            )
-            logger.debug(
-                "Brand mix post-balance",
+                "Brand mix (raw candidates)",
                 top_counts=_brand_histogram(candidates, 50),
             )
 
@@ -1861,7 +1855,21 @@ async def t_search_fashion_products(
         if base_products:
             base_products = await _numeric_rerank_products(query, base_products)
             base_products = _dedupe_products(base_products)
-            base_products = _brand_cap(base_products, Config.MAX_PER_BRAND_DISPLAY)
+            # Debug sample after numeric rerank
+            try:
+                sample = [
+                    {
+                        "brand": p.get("brand"),
+                        "title": p.get("title"),
+                        "source": p.get("from_query"),
+                        "category_path": p.get("category_path"),
+                        "score": p.get("score"),
+                    }
+                    for p in base_products[:5]
+                ]
+                logger.debug("rerank_sample", count=len(base_products), top5=sample)
+            except Exception:
+                pass
 
         final_products = base_products
         if final_products and Config.USE_LLM_RERANK:
@@ -1869,39 +1877,50 @@ async def t_search_fashion_products(
                 query, final_products, Config.MIN_PRODUCTS_TARGET
             )
             if llm_ranked:
-                final_products = _brand_cap(llm_ranked, Config.MAX_PER_BRAND_DISPLAY)
+                final_products = llm_ranked
 
-        # ❌ DISABLED: Automatic web search fallback (too slow, ~38s)
-        # Instead, the orchestrator will ask the user if they want web search
-        # when catalog results are insufficient
-        
-        # web_products: List[Dict[str, Any]] = []
-        # if len(final_products) < Config.MIN_PRODUCTS_TARGET:
-        #     needed = Config.MIN_PRODUCTS_TARGET - len(final_products)
-        #     existing_keys = {
-        #         key
-        #         for key in (_product_identity(p) for p in final_products)
-        #         if key
-        #     }
-        #     web_products = await _fetch_web_topup_products(
-        #         query, existing_keys, needed
-        #     )
-        #     if web_products:
-        #         logger.info(
-        #             'Using web search fallback',
-        #             added=len(web_products),
-        #             needed=needed,
-        #         )
-        #         base_with_web = _dedupe_products((base_products or []) + web_products)
-        #         reranked = await _llm_rerank_products(
-        #             query, base_with_web, Config.MIN_PRODUCTS_TARGET
-        #         )
-        #         final_products = reranked or base_with_web
-        #     else:
-        #         logger.warning(
-        #             'Web search fallback returned nothing',
-        #             requested=needed,
-        #         )
+        catalog_count = len(final_products)
+        needs_web_topup = catalog_count < Config.CATALOG_MIN_RESULTS
+        web_products: List[Dict[str, Any]] = []
+        used_web_search = False
+
+        if needs_web_topup and web_allowed:
+            needed = max(
+                Config.MIN_PRODUCTS_TARGET - catalog_count,
+                Config.CATALOG_MIN_RESULTS - catalog_count,
+                0,
+            )
+            existing_keys = {
+                key
+                for key in (_product_identity(p) for p in final_products)
+                if key
+            }
+            web_products = await _fetch_web_topup_products(
+                query, existing_keys, needed
+            )
+            if web_products:
+                used_web_search = True
+                logger.info(
+                    'Using web search fallback',
+                    added=len(web_products),
+                    needed=needed,
+                )
+                base_with_web = _dedupe_products((base_products or []) + web_products)
+                reranked = await _llm_rerank_products(
+                    query, base_with_web, Config.MIN_PRODUCTS_TARGET
+                )
+                final_products = reranked or base_with_web
+            else:
+                logger.warning(
+                    'Web search fallback returned nothing',
+                    requested=needed,
+                )
+        elif needs_web_topup and not web_allowed:
+            logger.info(
+                'Skipping web search fallback (not approved)',
+                needed=Config.CATALOG_MIN_RESULTS - catalog_count,
+                available=catalog_count,
+            )
 
         ranked_products: List[Dict[str, Any]] = []
         for idx, product in enumerate(final_products, 1):
@@ -1924,6 +1943,12 @@ async def t_search_fashion_products(
         result_payload = {
             "products": display_products,
             "total_found": len(final_products),
+            "catalog_count": catalog_count,
+            "catalog_min_threshold": Config.CATALOG_MIN_RESULTS,
+            "needs_web_search": needs_web_topup,
+            "used_web_search": used_web_search,
+            "web_allowed": web_allowed,
+            "web_topup_count": len(web_products),
             "search_type": search_type,
             "queries_used": queries,
             "best_score": best_score,
@@ -1950,6 +1975,12 @@ async def t_search_fashion_products(
         return {
             "products": [],
             "total_found": 0,
+            "catalog_count": 0,
+            "catalog_min_threshold": Config.CATALOG_MIN_RESULTS,
+            "needs_web_search": True,
+            "used_web_search": False,
+            "web_allowed": web_allowed,
+            "web_topup_count": 0,
             "search_type": search_type,
             "queries_used": [query],
             "best_score": 0.0,
@@ -2130,7 +2161,8 @@ TOOLS_SCHEMA = [
         "description": (
             "Smart fashion search backed ONLY by the internal catalog (Qdrant). "
             "Use this for any request that involves buying, showing, or recommending items. "
-            "Provide ONE tight fashion query (material + category + vibe) and the tool will auto-expand discovery/pairing cases into short searches, dedupe, rerank (vector + LLM), and guarantee at least 8 strong products with web-search fallback when needed. "
+            "Provide ONE tight fashion query (material + category + vibe) and the tool will auto-expand discovery/pairing cases into short searches, dedupe, rerank (vector + LLM), and return catalog results only. "
+            "If catalog results are fewer than 4, ask the user for consent before setting allow_web_search=true and retrying. "
             "Pass the user's latest message verbatim in user_message; do not rewrite it. "
             "Do NOT call this repeatedly in the same reply unless the user clearly asks for a brand-new category or filter. "
             "BAD Query: 'masculine wardrobe staples', 'party wear', 'office outfit'. "
@@ -2146,13 +2178,13 @@ TOOLS_SCHEMA = [
                     "description": "The user's latest message verbatim. Use this as the base query; do not rewrite.",
                 },
                 "user_gender": {"type": "string"},
-                "category_filter": {
-                    "type": "string",
-                    "description": "Optional category keyword to filter by (e.g. 'ethnic', 'traditional').",
-                },
                 "search_type": {
                     "type": "string",
                     "enum": ["auto", "specific", "discovery", "pairing"],
+                },
+                "allow_web_search": {
+                    "type": "boolean",
+                    "description": "Set to true ONLY after the user explicitly approves web search when catalog results are sparse (<4).",
                 },
             },
             "required": ["query"],
@@ -2240,8 +2272,6 @@ ASSUMPTIONS:
 CRITICAL GENDER RULE:
 - Once you know the user's gender preference (Menswear/Womenswear/Neutral), you MUST pass it as `user_gender` to EVERY call to search_fashion_products.
 - Example: If user chose "Menswear", then ALL searches must include user_gender="Menswear"
-  - ✅ search_fashion_products(query="Cotton kurta set", user_gender="Menswear", category_filter="ethnic")
-  - ❌ search_fashion_products(query="Cotton kurta set", category_filter="ethnic")  # Missing user_gender!
 - This applies to work wear, pairing, traditional wear, casual wear, EVERYTHING.
 - Only skip user_gender if the user explicitly wants opposite gender items (e.g., "show me women's dresses for my sister").
 
@@ -2276,7 +2306,7 @@ OVERALL UX VIBE:
   - Prefer:
     - Cotton or linen kurtas, churidar or straight pants, Nehru or Modi jackets, bandhgalas, juttis or loafers.
     - You can still add 1 or 2 smart Western looks like chinos with a shirt, but ethnic should be visible.
-    - CRITICAL: When searching for these, you MUST set `category_filter='ethnic'` in `search_fashion_products`.
+
 - For normal “office”, “meeting”, “interview”:
   - Talk in terms of modern Indian office wear: shirts, chinos, minimal sneakers or loafers, sometimes blazers or suits.
 - For “travel to <city> in <month> or next week”:
@@ -2291,6 +2321,16 @@ OVERALL UX VIBE:
   - If the user asks “what is the weather in <city> today or this week” or asks what to pack based on weather, you may call “get_weather”.
   - Use the weather only as a short helper line to adjust fabrics and layers.
   - Do not mention Open Meteo or any API by name in your reply.
+
+4) Catalog-first, web-search only with approval:
+- You must treat search_fashion_products as catalog-only by default. Never assume web data is available unless the user approves it.
+- After any call to search_fashion_products, check the counts in the tool output:
+  - If “catalog_count” >= 4: proceed normally, do NOT offer web search.
+  - If “catalog_count” is 1–3: show those pieces, say the catalog is thin, and ask “Want me to search the web for more?”.
+  - If “catalog_count” is 0: say “No good matches in the catalog”, then ask if they want web search or a refined query.
+- When you ask, show quick-reply chips via show_options: ["Yes, search the web", "No, stay in catalog"].
+- Only if the user explicitly says yes (or clicks yes) should you call search_fashion_products again with allow_web_search=true to top up results.
+- If the user declines, stay in catalog mode and offer a refinement question instead of using the web.
 
 6) Trends:
 - You will receive a separate system message with cached fashion trend notes for western and ethnic wear.
@@ -2455,7 +2495,7 @@ async def _run_single_tool_call(tool_call, budget: Budget) -> Dict[str, Any]:
         ms = int((time.perf_counter() - t0) * 1000)
         budget.consume(name or "unknown", ms, success=False)
         logger.error("❌ Tool execution failed", tool=name, duration_ms=ms, error=str(e))
-        logger.error(traceback.print_exc())
+        logger.error(traceback.format_exc())
         return {
             "type": "function_call_output",
             "call_id": call_id,

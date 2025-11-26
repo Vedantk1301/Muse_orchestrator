@@ -34,22 +34,25 @@ Goal:
 Rank the documents so that higher scores mean more relevant to the user query.
 
 Relevance rules:
-1. Match product type (shirt, kurta, dress, trousers, co-ord, sneakers, etc.).
-2. Match fabric, fit, colour family, and the overall vibe (casual, work, travel, date, festive).
-3. Respect gender hints (men, women, unisex) when present.
-4. If the query mentions budget, prefer products whose INR price is closer to the mentioned range.
-5. Exact keyword match is NOT required; semantic, silhouette, and vibe match are more important.
+1) Match product type/category (shirt, kurta, saree, lehenga, anarkali, dress, trousers, co-ord, sneakers, etc.).
+2) For clearly ethnic queries (saree, lehenga, anarkali, kurta, sherwani, dupatta, kurta pajama): BOOST ethnic/traditional items; DEMOTE western/athleisure (blazers, polos, joggers, tees) unless explicitly requested.
+3) For clearly western queries (blazer, polo, chinos, slip dress, bodycon): avoid returning ethnic/traditional items.
+4) Match fabric, fit, colour family, and vibe (casual, work, travel, date, festive, wedding) over exact wording.
+5) Respect gender hints (men, women, unisex) when present.
+6) If the query mentions budget, prefer products whose INR price is closer to the mentioned range.
+7) Exact keyword match is NOT required; semantic, silhouette, and vibe match are more important, but irrelevant categories must be pushed down.
 
 Diversity rules (important for top results):
-1. In the top 8 results, prefer at least 3–4 different brands if possible.
-2. Avoid placing many items from the same brand consecutively when good alternatives exist.
-3. Prefer mixing silhouettes when multiple types fit the query (e.g., a couple of shirts, a polo, a lightweight overshirt), instead of returning 8 near-duplicates.
-4. Diversity should never override clear irrelevance. Always keep unrelated products low.
+1) In the top 8 results, prefer at least 3–4 different brands if possible.
+2) Avoid placing many items from the same brand consecutively when good alternatives exist (no more than 2 back-to-back from one brand).
+3) Prefer mixing silhouettes when multiple types fit the query (e.g., shirts + polos + overshirts) instead of near-duplicates.
+4) Diversity should never override clear irrelevance. Always keep unrelated products low.
 
 Scoring guidance:
-- Give higher scores to documents that best balance query relevance and diversity.
-- Do not overvalue repeated wording or near-duplicate titles from a single brand.
-- Do not penalize shorter descriptions as long as relevance signals are clear.
+1) Rank by relevance first, then adjust for diversity/brand spread.
+2) Penalize near-duplicate titles from a single brand when alternatives exist.
+3) Do not penalize shorter descriptions as long as relevance signals are clear.
+4) When the query contains ethnic terms, downrank western/athleisure items even if they have matching words.
 
 Output:
 Return scores that, when sorted descending, produce a relevant and diverse ranked list of products.
