@@ -118,7 +118,7 @@ class Config:
     MAX_TOOL_CALLS = int(os.getenv("MAX_TOOL_CALLS", "10"))
     MAX_LATENCY_MS = int(os.getenv("MAX_LATENCY_MS", "45000"))
 
-    CATALOG_COLLECTION = os.getenv("CATALOG_COLLECTION", "fashion_qwen4b_text")
+    CATALOG_COLLECTION = os.getenv("CATALOG_COLLECTION", "new_qwen_embeddings")
     HNSW_EF = int(os.getenv("HNSW_EF", "256"))
 
     SIMPLE_SEARCH_LIMIT = 15
@@ -913,6 +913,14 @@ QUERY CONTEXT (REFINEMENTS - CRITICAL):
   - APPEND the filter to each existing query.
   - Example: Context="traveling to Dubai [queries: linen maxi dress, cotton kurta palazzo]", Query="under 2000"
     -> Output queries=["linen maxi dress under 2000", "cotton kurta palazzo under 2000", "breathable jumpsuit under 2000"]
+
+- If "TRY AGAIN" / "RETRY" / "SOMETHING ELSE":
+  - The user liked the INTENT but hated the specific results.
+  - Keep the SAME search_type and general topic.
+  - Generate 3 NEW, DIFFERENT queries for the same intent.
+  - Do NOT repeat the queries from last_query_context.
+  - Example: Context="traveling to Shimla [queries: wool sweater, puffer jacket]", Query="try again"
+    -> Output queries=["thermal lined hoodie", "fleece jacket", "merino wool base layer"]
   
 - If NEW TOPIC:
   - Ignore last_query_context and generate fresh queries for the new topic.
@@ -1264,6 +1272,30 @@ def _product_identity(product: Dict[str, Any]) -> Optional[str]:
     )
 
 
+def _extract_price_value(payload: Dict[str, Any]) -> Optional[float]:
+    """
+    Extract a single numeric price (INR) from Qdrant payload.
+
+    Priority:
+    1) attributes.price  (scraped numeric price)
+    2) price.current     (from the 'price' object)
+    """
+    try:
+        attrs = payload.get("attributes") or {}
+        attr_price = attrs.get("price")
+        if isinstance(attr_price, (int, float)):
+            return float(attr_price)
+
+        price_block = payload.get("price") or {}
+        current = price_block.get("current")
+        if isinstance(current, (int, float)):
+            return float(current)
+    except Exception:
+        pass
+
+    return None
+
+
 def _interleave_results(results_lists: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     if not results_lists:
         return []
@@ -1506,9 +1538,8 @@ async def _llm_rerank_products(
             {
                 "id": str(_product_identity(product)),
                 "title": product.get("title"),
-                "brand": product.get("brand"),
+                "brand": product.get("attributes", {}).get("brand") or product.get("brand"),
                 "category_leaf": product.get("category") or product.get("category_leaf"),
-                "score": round(float(product.get("score", 0.0)), 4),
                 "score": round(float(product.get("score", 0.0)), 4),
                 "source": product.get("from_query") or product.get("source") or "catalog",
                 "price": product.get("price_inr") or product.get("price") or "Unknown",
@@ -1687,6 +1718,8 @@ async def t_search_fashion_products(
     allow_web_search: bool = False,
     budget: Optional[Budget] = None,
     user_message: Optional[str] = None,
+    min_price_inr: Optional[float] = None,
+    max_price_inr: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     - Filters by user_gender when provided (Menswear -> men, Womenswear -> women).
@@ -1705,31 +1738,105 @@ async def t_search_fashion_products(
 
     web_allowed = bool(Config.USE_WEB_TOPUP or allow_web_search)
 
+    raw_user_message = (user_message or "").strip()
+    raw_user_lower = raw_user_message.lower()
+    vibe_chips = {"casual", "work", "date", "travel", "festive"}
+
+    # If the user only provided a high-level vibe chip, pause search and ask for details
+    if raw_user_lower in vibe_chips:
+        logger.info("🛑 Pure vibe chip received, deferring search", vibe=raw_user_lower)
+
+        clarification_messages = {
+            "travel": (
+                "User only said the vibe 'Travel'. Ask where they are going, when (month or dates), how many days, and whether it's for work, sightseeing, or chill before searching.",
+                [
+                    "Which city or place are you travelling to?",
+                    "When are you going (dates or month)?",
+                    "Is it for work, sightseeing, or chill and how many days?",
+                ],
+            ),
+            "work": (
+                "User picked 'Work' without details. Ask about office vibe or dress code (formal vs smart casual), whether they need shirts, trousers, or a full look, and any colour constraints before searching.",
+                [
+                    "What is your office vibe or dress code (formal, smart casual, startup)?",
+                    "Do you need a full look or just shirts/trousers?",
+                    "Any colours or fits you avoid?",
+                ],
+            ),
+            "date": (
+                "User picked 'Date' without details. Ask what kind of date (coffee, dinner, outdoors), time of day, and how dressed up they want to be before searching.",
+                [
+                    "What kind of date is it (coffee, dinner, outdoors)?",
+                    "When is it happening (time of day or day of week)?",
+                    "Do you want something relaxed, smart casual, or dressier?",
+                ],
+            ),
+            "festive": (
+                "User picked 'Festive' without details. Ask which occasion (puja, sangeet, party), timing, and whether they want traditional or fusion before searching.",
+                [
+                    "What is the occasion (puja, sangeet, party)?",
+                    "When is it happening?",
+                    "Do you prefer traditional or a fusion vibe?",
+                ],
+            ),
+            "casual": (
+                "User picked 'Casual' without details. Ask where they're wearing it, preferred vibe (minimal, sporty, street), and any colour or fit preferences before searching.",
+                [
+                    "Where will you wear this (out with friends, errands, home)?",
+                    "Do you prefer minimal, sporty, or street vibes?",
+                    "Any colours or fits you avoid?",
+                ],
+            ),
+        }
+
+        clar_message, clar_questions = clarification_messages.get(
+            raw_user_lower,
+            (
+                "User picked a vibe chip without context. Ask for the specific occasion, timing, formality, and items they need before searching.",
+                [],
+            ),
+        )
+
+        result_payload = {
+            "products": [],
+            "total_found": 0,
+            "catalog_count": 0,
+            "catalog_min_threshold": Config.CATALOG_MIN_RESULTS,
+            "needs_web_search": False,
+            "used_web_search": False,
+            "web_allowed": web_allowed,
+            "web_topup_count": 0,
+            "search_type": "discovery",
+            "queries_used": [],
+            "original_query": raw_user_message or query,
+            "best_score": 0.0,
+            "total_candidates": 0,
+            "needs_clarification": True,
+            "clarification_type": "travel" if raw_user_lower == "travel" else raw_user_lower,
+            "clarification_message": clar_message,
+            "clarification_questions": clar_questions,
+        }
+
+        return result_payload
+
 
     # Enforce that the base query comes from the user's latest message if provided
-    if user_message and user_message != query:
+    if user_message and user_message != query and raw_user_lower not in vibe_chips:
         logger.debug("🔄 Overriding model query with user_message", model_query=query, user_message=user_message)
         query = user_message
 
-    # Build a more contextual base query when the user picked a vibe chip
+    # Add gender context to the base query when available
     gender_phrase = None
     if user_gender:
         gmap = {"menswear": "for men", "womenswear": "for women", "neutral": "unisex"}
         gender_phrase = gmap.get(user_gender.lower())
 
     ql = query.strip().lower()
-    vibe_chips = {"casual", "work", "date", "travel", "festive"}
-    if ql in vibe_chips:
-        base = f"{query.strip()} outfits"
-        if gender_phrase:
-            base = f"{base} {gender_phrase}"
-        query = base.strip()
-        ql = query.lower()
-    elif gender_phrase and gender_phrase not in ql:
+    if gender_phrase and gender_phrase not in ql:
         query = f"{query.strip()} {gender_phrase}".strip()
         ql = query.lower()
 
-    cache_key = _cache_key("search", query.lower(), search_type, user_gender, web_allowed)
+    cache_key = _cache_key("search", query.lower(), search_type, user_gender, web_allowed, min_price_inr, max_price_inr)
     cached = await SEARCH_CACHE.get(cache_key)
     if cached:
         logger.success("💾 search cache HIT")
@@ -1741,9 +1848,7 @@ async def t_search_fashion_products(
     try:
         await Services.ensure_loaded()
 
-        # Decide when to call classifier:
-        # - auto / discovery / pairing => classifier with optional forced type
-        # - specific => just one query
+        # Always classify intent and allow a forced search_type hint when provided
         ql = query.lower()
 
         # 🆕 Extract product context from budget if available
@@ -1765,21 +1870,25 @@ async def t_search_fashion_products(
                 last_query_context = f"{original_q} [queries: {queries_str}]"
                 logger.info(f"📋 Using last query context: {last_query_context}")
 
-        if search_type in ("auto", "discovery", "pairing"):
-            forced_type = None if search_type == "auto" else search_type
-            intent = await t_classify_intent(
-                query, 
-                user_gender, 
-                forced_type=forced_type, 
-                product_context=product_context,
-                last_query_context=last_query_context
-            )
-            search_type = intent.get("search_type", "specific")
-            queries = intent.get("queries", [query])
-            if forced_type:
-                search_type = forced_type
-        else:
-            search_type = "specific"
+        normalized_type = (search_type or "auto").lower()
+        forced_type = None
+        if normalized_type in ("discovery", "pairing", "specific"):
+            forced_type = normalized_type
+        elif normalized_type not in ("auto",):
+            logger.warning("Invalid search_type from model; defaulting to auto classification", search_type=normalized_type)
+            normalized_type = "auto"
+
+        intent = await t_classify_intent(
+            query, 
+            user_gender, 
+            forced_type=forced_type, 
+            product_context=product_context,
+            last_query_context=last_query_context
+        )
+
+        search_type = forced_type or intent.get("search_type") or "specific"
+        queries = intent.get("queries") or [query]
+        if not queries:
             queries = [query]
 
         # Extra specialisation for "trending" like queries
@@ -1808,14 +1917,40 @@ async def t_search_fashion_products(
         if user_gender:
             gender_map = {
                 "menswear": "men",
+                "men": "men",
+                "male": "men",
                 "womenswear": "women", 
-                "neutral": "unisex",
+                "women": "women",
+                "female": "women",
+                "neutral": None,
+                "unisex": "unisex",
             }
             gender_filter_value = gender_map.get(user_gender.lower())
 
+        query_filter = None
+        if gender_filter_value:
+            # Include unisex for both men and women
+            if gender_filter_value == "men":
+                gender_condition = rest.FieldCondition(
+                    key="attributes.gender",
+                    match=rest.MatchAny(any=["men", "unisex"])
+                )
+            elif gender_filter_value == "women":
+                gender_condition = rest.FieldCondition(
+                    key="attributes.gender",
+                    match=rest.MatchAny(any=["women", "unisex"])
+                )
+            else:  
+                # neutral or unhandled values → only match explicit 'unisex'
+                gender_condition = rest.FieldCondition(
+                    key="attributes.gender",
+                    match=rest.MatchValue(value="unisex")
+                )
+
+            query_filter = rest.Filter(must=[gender_condition])
+
         async def _search_one(q: str, vec: List[float]):
             def _do():
-                # No filters applied (category/gender disabled for debugging)
                 return Services.qdr.query_points(
                     collection_name=Config.CATALOG_COLLECTION,
                     query=vec,
@@ -1826,7 +1961,7 @@ async def t_search_fashion_products(
                     ),
                     with_payload=True,
                     search_params=rest.SearchParams(hnsw_ef=Config.HNSW_EF),
-                    query_filter=None,
+                    query_filter=query_filter,
                 )
 
             return await asyncio.to_thread(_do)
@@ -1856,7 +1991,6 @@ async def t_search_fashion_products(
             q_products: List[Dict[str, Any]] = []
             for point in (result.points or [])[:per_query]:
                 payload = point.payload or {}
-                commerce = payload.get('commerce') or {}
                 pid = (
                     payload.get('product_id')
                     or payload.get('id')
@@ -1869,18 +2003,21 @@ async def t_search_fashion_products(
                 score = float(point.score)
                 best_score = max(best_score, score)
 
+                price_val = _extract_price_value(payload)
+
                 card = {
                     'id': pid,
                     'product_id': pid,
                     'title': payload.get('title'),
-                    'brand': payload.get('brand'),
+                    'brand': payload.get('brand') or (payload.get("attributes") or {}).get("brand"),
                     'category': payload.get('category_leaf'),
                     'category_leaf': payload.get('category_leaf'),
                     'category_path': payload.get('category_path'),
                     'image_url': payload.get('primary_image') or payload.get('image_url'),
                     'url': payload.get('url'),
-                    'price': commerce.get('price'),
-                    'price_inr': commerce.get('price_inr'),
+                    # canonical numeric price in INR
+                    'price': price_val,
+                    'price_inr': price_val,
                     'score': score,
                     'from_query': q,
                     'source_tags': payload.get('source_tags') or [],
@@ -1921,6 +2058,30 @@ async def t_search_fashion_products(
             count=total_candidates,
             best_score=best_score,
         )
+
+        # Apply price filter in Python if requested
+        if min_price_inr is not None or max_price_inr is not None:
+            before = len(candidates)
+            filtered: List[Dict[str, Any]] = []
+            for p in candidates:
+                price_val = p.get("price_inr") or p.get("price")
+                if price_val is None:
+                    continue
+                if min_price_inr is not None and price_val < min_price_inr:
+                    continue
+                if max_price_inr is not None and price_val > max_price_inr:
+                    continue
+                filtered.append(p)
+
+            candidates = filtered
+            total_candidates = len(candidates)
+            logger.info(
+                "Price filter applied",
+                before=before,
+                after=total_candidates,
+                min_price_inr=min_price_inr,
+                max_price_inr=max_price_inr,
+            )
 
         base_products = candidates
         if base_products:
@@ -2025,6 +2186,8 @@ async def t_search_fashion_products(
             "original_query": query,
             "best_score": best_score,
             "total_candidates": total_candidates,
+            "min_price_inr": min_price_inr,
+            "max_price_inr": max_price_inr,
             "_all_products": stored_products,
         }
 
@@ -2219,6 +2382,7 @@ async def _generate_quick_options_local(
         "3) If no clear options, return [].\n"
         "4) If hint='product_refinement', generate ACTIONS like 'Under ₹2000', 'Show matching footwear', 'Different colors'. Do NOT just repeat attributes like 'Cotton' or 'Blue'.\n"
         "5) If hint='question', generate the specific answer choices implied by the question.\n"
+        "6) CRITICAL: If the user just answered a question (e.g. 'Menswear'), DO NOT generate options asking the same thing again. If the conversation is flowing naturally without a clear need for chips, return [].\n"
     )
 
     user_lines = [f"Bot message: {context}"]
@@ -2309,27 +2473,103 @@ async def t_show_options(
         return {"options": []}
 
 
+async def t_search_catalog_metadata(
+    query: Optional[str] = None,
+    field: str = "brand",
+    limit: int = 10
+) -> Dict[str, Any]:
+    """
+    Search for available metadata values (like brands) in the catalog.
+    Useful for answering "What brands do you have?" or checking if a specific brand exists.
+    """
+    logger.info("🔍 search_catalog_metadata", query=query, field=field)
+    try:
+        await Services.ensure_loaded()
+        
+        from qdrant_client.http import models as rest
+        
+        unique_values = set()
+        
+        if query:
+            # Search for specific value using a match filter
+            should_filter = [
+                rest.FieldCondition(
+                    key=f"attributes.{field}",
+                    match=rest.MatchText(text=query)
+                ),
+                rest.FieldCondition(
+                    key=field,
+                    match=rest.MatchText(text=query)
+                )
+            ]
+            
+            filter_query = rest.Filter(should=should_filter)
+            
+            # Check existence
+            results = await asyncio.to_thread(
+                Services.qdr.scroll,
+                collection_name=Config.CATALOG_COLLECTION,
+                scroll_filter=filter_query,
+                limit=limit,
+                with_payload=True
+            )
+            points = results[0]
+        else:
+            # No query, just get a sample to list available options
+            results = await asyncio.to_thread(
+                Services.qdr.scroll,
+                collection_name=Config.CATALOG_COLLECTION,
+                limit=50, # Fetch more to find unique values
+                with_payload=True
+            )
+            points = results[0]
+            
+        # Extract values
+        found_items = []
+        for point in points:
+            payload = point.payload or {}
+            val = payload.get("attributes", {}).get(field) or payload.get(field)
+            if val:
+                norm = str(val).strip()
+                # Simple dedupe (case-insensitive check)
+                if norm and norm.lower() not in [x.lower() for x in unique_values]:
+                    unique_values.add(norm)
+                    found_items.append(norm)
+                    
+        return {
+            "field": field,
+            "query": query,
+            "found": sorted(list(unique_values))[:limit],
+            "count": len(unique_values)
+        }
+
+    except Exception as e:
+        logger.error("❌ search_catalog_metadata failed", error=str(e))
+        return {"error": str(e), "found": []}
+
+
 TOOLS_MAP = {
     "search_fashion_products": t_search_fashion_products,
     "tone_reply": t_tone_reply,
     "get_weather": t_get_weather,
     # "generate_search_suggestions": t_generate_search_suggestions,
     "show_options": t_show_options,
+    "search_catalog_metadata": t_search_catalog_metadata,
 }
 
 TOOLS_SCHEMA = [
     {
         "type": "function",
-        "name": "search_fashion_products",
-        "description": (
-            "Smart fashion search backed ONLY by the internal catalog (Qdrant). "
-            "Use this for any request that involves buying, showing, or recommending items. "
-            "Provide ONE tight fashion query (material + category + vibe) and the tool will auto-expand discovery/pairing cases into short searches, dedupe, rerank (vector + LLM), and return catalog results only. "
-            "If catalog results are fewer than 4, ask the user for consent before setting allow_web_search=true and retrying. "
-            "Pass the user's latest message verbatim in user_message; do not rewrite it. "
-            "Do NOT call this repeatedly in the same reply unless the user clearly asks for a brand-new category or filter. "
-            "BAD Query: 'masculine wardrobe staples', 'party wear', 'office outfit'. "
-            "GOOD Query: 'White Linen Shirt', 'Navy Blue Chinos', 'Black Leather Boots', 'Beige Cotton Trousers'. "
+    "name": "search_fashion_products",
+    "description": (
+        "Smart fashion search backed ONLY by the internal catalog (Qdrant). "
+        "Use this for any request that involves buying, showing, or recommending items. "
+        "Provide ONE tight fashion query (material + category + vibe) and the tool will auto-expand discovery/pairing cases into short searches, dedupe, rerank (vector + Qwen reranker), and return catalog results only. "
+        "If catalog results are fewer than 4, ask the user for consent before setting allow_web_search=true and retrying. "
+        "Pass the user's latest message verbatim in user_message; do not rewrite it. "
+        "Do NOT call this repeatedly in the same reply unless the user clearly asks for a brand-new category or filter. "
+        "BAD Query: 'masculine wardrobe staples', 'party wear', 'office outfit'. "
+        "GOOD Query: 'White Linen Shirt', 'Navy Blue Chinos', 'Black Leather Boots', 'Beige Cotton Trousers'. "
             "The search engine only understands: Material, Color, Fit, Category, Pattern."
         ),
         "parameters": {
@@ -2348,6 +2588,14 @@ TOOLS_SCHEMA = [
                 "allow_web_search": {
                     "type": "boolean",
                     "description": "Set to true ONLY after the user explicitly approves web search when catalog results are sparse (<4).",
+                },
+                "min_price_inr": {
+                    "type": "number",
+                    "description": "Minimum price in INR (inclusive). Optional.",
+                },
+                "max_price_inr": {
+                    "type": "number",
+                    "description": "Maximum price in INR (inclusive). Optional.",
                 },
             },
             "required": ["query"],
@@ -2402,11 +2650,34 @@ TOOLS_SCHEMA = [
                 },
                 "hint": {
                     "type": "string",
-                    "enum": ["product_refinement", "question", None],
-                    "description": "Optional hint: 'product_refinement' after products, 'question' when asking, or null for auto-detect"
+                    "enum": ["product_refinement", "question"],
+                    "description": "Optional hint: 'product_refinement' after products, 'question' when asking, or omit for auto-detect"
                 },
             },
             "required": ["context"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "search_catalog_metadata",
+        "description": "Search for available brands or metadata in the catalog. Use this when the user asks 'What brands do you have?' or 'Do you have X?'.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Specific value to check for (e.g. 'Fabindia'). Leave empty to list random available ones."
+                },
+                "field": {
+                    "type": "string",
+                    "default": "brand",
+                    "description": "Field to search in (default: 'brand')."
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 10
+                }
+            },
         },
     },
 ]
@@ -2472,6 +2743,18 @@ OVERALL UX VIBE:
 - Only if the user explicitly says yes (or clicks yes) should you call search_fashion_products again with allow_web_search=true to top up results.
 - If the user declines, stay in catalog mode and offer a refinement question instead of using the web.
 
+4) Weather & Travel:
+- If the user mentions travelling to a specific city or asks about packing for a location:
+  - Call `get_weather(city=...)` to get real-time context.
+  - Use the weather info (temp, rain) to justify your outfit recommendations.
+  - Example: "Since it's 12°C and rainy in London, I've picked waterproof layers..."
+
+5) Brand & Metadata Questions:
+- If the user asks "What brands do you have?" or "Do you have Fabindia?":
+  - Call `search_catalog_metadata(query='Fabindia', field='brand')` to check.
+  - If they ask generally, call `search_catalog_metadata(field='brand')` to get a sample list.
+  - Do NOT hallucinate brands. Only list what the tool returns.
+
 6) Trends:
 - You will receive a separate system message with cached fashion trend notes for western and ethnic wear.
 - Use this only as light seasoning, not strict truth.
@@ -2496,6 +2779,8 @@ OVERALL UX VIBE:
   - If the UI has buttons for gender, you can say:
     - “You can tap an option or just tell me”
 - After the user picks Menswear/Womenswear/Neutral, your next clarification should be the occasion / vibe (for example Work, Date, Travel, Festive, Casual). Prefer those options over specific product categories so discovery stays broad.
+- If the user only gives a vibe chip (Work, Date, Travel, Festive, Casual) with no details, do NOT call search_fashion_products yet. Ask 2-3 pointed follow-ups first (Travel: city + timing + trip type, Work: office vibe or dress code and whether they need shirts/trousers/full look, Date: venue/time/dressiness, Festive or Casual: exact occasion, timing, how dressed up they want). Search only after they answer.
+- If search_fashion_products returns with "needs_clarification": true, do NOT assume there are products. Read the "clarification_message" and "clarification_questions", ask 1-3 of them in your own words, and do not call search_fashion_products again until the user answers.
 - The question about name or gender should be separate from other questions and not spammy.
 - End each message with just one simple next step question.
 
@@ -2953,7 +3238,6 @@ async def run_conversation_stream(
 ) -> AsyncGenerator[str, None]:
     logger.info("📡 STREAMING conversation", user_id=user_id, message=message[:50])
 
-    ack_t0 = time.perf_counter()
     ack_t0 = time.perf_counter()
     
     # Cheap ACK logic
